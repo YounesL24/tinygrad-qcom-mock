@@ -40,6 +40,8 @@ def get_enqueue_devs(call:UOp) -> Any|None:
   if call.src[0].op is Ops.COPY: bufs = bufs[::-1] # copies push from the src device: p2p writes are faster than reads
   devs = min(bufs, key=lambda b: not all_devices_in(b.device, HCQ_DEVS)).device
   if not all_devices_in(devs, HCQ_DEVS): return None
+  dev = Device[to_tuple(devs)[0]]
+  if call.src[0].op is Ops.COPY and not dev.has_copy_queue and type(dev.allocator)._map is Allocator._map: return None
   return devs
 
 def unwrap_view(v:UOp) -> tuple[UOp, int]: # look through views to (base, byte offset)
