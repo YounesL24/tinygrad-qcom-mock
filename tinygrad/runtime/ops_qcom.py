@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os, ctypes, functools, mmap, struct, array, math, sys, contextlib
+
 assert sys.platform != 'win32'
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
@@ -201,6 +202,11 @@ class QCOMComputeQueue(HWQueue):
 
     idir, base, nr, struct_t = kgsl.IOCTL_KGSL_GPU_COMMAND.args
     ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
+
+    if self.dev.fd.__class__.__name__.startswith("Mock"):
+      ioctl_uop = ccall_ptr(self.dev.fd.ioctl_cb_type, self.dev.fd.ioctl_cb, UOp.const(ioctl_cmd, dtypes.uint32), req.after(cmdbuf).index(0))
+      return ret.index(0).store(UOp.const(0, dtypes.int)).after(ioctl_uop)
+      # return ret.index(0).store(ccall_ptr(self.dev.fd.ioctl_cb_type, self.dev.fd.ioctl_cb, UOp.const(ioctl_cmd, dtypes.uint32), req.after(cmdbuf).index(0)))
     return ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.after(cmdbuf).index(0)))
 
 class QCOMProgramData:
@@ -327,7 +333,6 @@ class QCOMDevice(Compiled):
     info = kgsl.struct_kgsl_devinfo()
     kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY(self.fd, type=kgsl.KGSL_PROP_DEVICE_INFO, value=ctypes.addressof(info), sizebytes=ctypes.sizeof(info))
     self.gpu_id = (info.chip_id >> 24, (info.chip_id >> 16) & 0xFF, (info.chip_id >> 8) & 0xFF)
-
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={info.chip_id:#x}")
 

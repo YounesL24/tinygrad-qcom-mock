@@ -59,6 +59,8 @@ class MockFileIOInterface(FileIOInterface):
   def __init__(self, path:str="", flags:int=os.O_RDONLY, fd:int|None=None):
     self.path = path
     self.fd = fd or _open(path, flags)
+    self.ioctl_cb_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_uint64)
+    self.ioctl_cb = self.ioctl_cb_type(self.ioctl)
 
   def __del__(self):
     if self.fd in tracked_fds:
@@ -68,7 +70,11 @@ class MockFileIOInterface(FileIOInterface):
 
   def ioctl(self, request, arg):
     if self.fd in tracked_fds:
-      return tracked_fds[self.fd].ioctl(self.fd, request, ctypes.addressof(arg))
+      if isinstance(arg, int):
+        arg_ptr = arg
+      else:
+        arg_ptr = ctypes.addressof(arg)
+      return tracked_fds[self.fd].ioctl(self.fd, request, arg_ptr)
     return fcntl.ioctl(self.fd, request, arg)
 
   def mmap(self, start, sz, prot, flags, offset):

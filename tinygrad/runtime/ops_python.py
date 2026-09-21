@@ -61,8 +61,8 @@ class PythonProgram(Program['PythonDevice']):
       i = 0
       while i < len(self.uops):
         u = self.uops[i]
-        src_values = [values[v] for v in u.src if v.dtype is not dtypes.void]
-        src_dtypes = [v.dtype for v in u.src if v.dtype is not dtypes.void]
+        src_values = [values[v] for v in u.src if v.dtype is not dtypes.void or (u.op is Ops.CALL and v.op is Ops.CUSTOM_FUNCTION)]
+        src_dtypes = [v.dtype for v in u.src if v.dtype is not dtypes.void or (u.op is Ops.CALL and v.op is Ops.CUSTOM_FUNCTION)]
         if getenv("TRACE"): print(i, u.op, u.dtype, u.arg, src_values, src_dtypes)
         if u.op is Ops.BACKEDGE:
           i = self.uop_to_index[u.src[1]] if values[u.src[2]][0] else i+1
@@ -83,6 +83,13 @@ class PythonProgram(Program['PythonDevice']):
           i += 1
           continue
         if u.op is Ops.STORE:
+          if len(src_values) != 2:
+            print("BAD STORE")
+            print("src count:", len(u.src))
+            for i, s in enumerate(u.src):
+              print(i, "op=", s.op, "dtype=", s.dtype)
+            print("filtered:", [(s.op, s.dtype) for s in u.src if s.dtype is not dtypes.void])
+            raise RuntimeError
           assert len(src_values) == 2, f"STORE must be lowered to 2 srcs, got {len(src_values)}"
           store_gate = exec_masks[-1]
           for j,val in enumerate(src_values[1] if u.max_numel() > 1 else [src_values[1]]):

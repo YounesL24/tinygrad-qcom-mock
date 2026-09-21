@@ -3,7 +3,7 @@ import functools
 
 from test.mockgpu.driver import TextFileDesc, VirtDriver, VirtFile, VirtFileDesc
 
-from test.mockgpu.qcom.qcomgpu import QCOMGPU, CommandObject
+from test.mockgpu.qcom.qcomgpu import QCOMGPU, QCOMCommandObject
 from tinygrad.runtime.autogen import kgsl
 
 import functools
@@ -21,9 +21,14 @@ class KGSLFileDesc(VirtFileDesc):
     def __init__(self, fd, driver):
         super().__init__(fd)
         self.driver = driver
-
     def ioctl(self, fd, request, argp): return self.driver.kgsl_ioctl(request, argp)
-    def mmap(self, start, sz, prot, flags, fd, offset): return offset
+    def mmap(self, start, sz, prot, flags, fd, offset):
+        obj_id = offset // 0x1000
+        if obj_id not in self.driver.object_by_id: raise RuntimeError(f"invalid object id: {obj_id}")
+        return self.driver.object_by_id[obj_id].vaddr
+
+
+
 
 class QCOMContext:
     #TODO flag implementation and (increasingly unlikely) reference counting for invalidation
@@ -40,29 +45,19 @@ class QCOMContext:
             kgsl.KGSL_CONTEXT_PER_CONTEXT_TS |
             kgsl.KGSL_CONTEXT_USER_GENERATED_TS |
             kgsl.KGSL_CONTEXT_NO_FAULT_TOLERANCE |
-            kgsl.KGSL_CONTEXT_INVALIDATE_ON_FAULT |
             kgsl.KGSL_CONTEXT_CTX_SWITCH |
             kgsl.KGSL_CONTEXT_PRIORITY_MASK |
             kgsl.KGSL_CONTEXT_TYPE_MASK |
             kgsl.KGSL_CONTEXT_PWR_CONSTRAINT |
             kgsl.KGSL_CONTEXT_IFH_NOP |
             kgsl.KGSL_CONTEXT_SECURE |
-            kgsl.KGSL_CONTEXT_PREEMPT_STYLE_MASK |
-            kgsl.KGSL_CONTEXT_NO_SNAPSHOT |
-            kgsl.KGSL_CONTEXT_SPARSE
-        )
+            kgsl.KGSL_CONTEXT_PREEMPT_STYLE_MASK
+        ) #KGSL_CONTEXT_INVALIDATE_ON_FAULT, KGSL_CONTEXT_NO_SNAPSHOT, KGSL_CONTEXT_SPARSE not found in kgsl.py
         assert (flags & kgsl.KGSL_CONTEXT_PREAMBLE) and (flags & kgsl.KGSL_CONTEXT_NO_GMEM_ALLOC), "legacy context switch not supported on a630"
         return flags
     def submit_command(self, numcmds, cmdlist, cmdsize):
         cmd_ids = [0] * numcmds
-        for cmd_num in range(numcmds):
-            cmd_struct = kgsl.struct_kgsl_command_object.from_address(
-                cmdlist + 
-                cmdsize * cmd_num
-            )
-            if not cmd_struct.flags & kgsl.KGSL_CMDLIST_IB: raise NotImplementedError("Only KGSL_CMDLIST_IB is supported")
-            cmd_obj = CommandObject(cmd_struct.gpuaddr, cmd_struct.size)
-            cmd_ids[cmd_num] = self.gpu.submit_command(cmd_obj)
+        self.gpu.submit_command(numcmds, cmdlist, cmdsize)
         allocated_timestamp = self.timestamp
         self.submissions[allocated_timestamp] = cmd_ids
         self.timestamp += 1
@@ -104,29 +99,31 @@ class QCOMDriver(VirtDriver):
     def kgsl_ioctl(self, request, argp):
         (dir, size, typ, nr) = self._decode_request(request)
         assert typ == 0x09, "Expected type 0x09 for KGSL ioctl"
+
         if nr not in kgsl_ioctl_info: raise RuntimeError(f"unknown kgsl ioctl, {nr} unknown")
         name, struct_type = kgsl_ioctl_info[nr]
         struct = struct_type.from_address(argp)
 
         if nr == _ioctl_nr(kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY):
-            if struct.propid == kgsl.KGSL_PROP_DEVICE_INFO:
+            if struct.type == kgsl.KGSL_PROP_DEVICE_INFO:
                 info = ctypes.cast(
                     struct.value,
                     ctypes.POINTER(kgsl.struct_kgsl_devinfo)
                 )
-                info.contents = kgsl.struct_kgsl_devinfo(
-                    *self.gpu.devinfo.values()
-                )
+                info.contents.device_id = self.gpu.devinfo["device_id"]
+                info.contents.chip_id = self.gpu.devinfo["chip_id"]
+                info.contents.mmu_enabled = int(self.gpu.devinfo["mmu_enabled"])
+                info.contents.gmem_gpubaseaddr = self.gpu.devinfo["gmem_gpubaseaddr"]
+                info.contents.gpu_id = self.gpu.devinfo["gpu_id"]
+                info.contents.gmem_sizebytes = self.gpu.devinfo["gmem_sizebytes"]
                 struct.sizebytes = kgsl.struct_kgsl_devinfo.SIZE
             else: raise NotImplementedError(f"property id {struct.propid} not implemented")
-        elif nr == _ioctl_nr(kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTD):
+        elif nr == _ioctl_nr(kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID):
             ctx_id = struct.context_id
             if ctx_id not in self.context_by_id: raise RuntimeError(f"invalid context id: {ctx_id}")
-
             ctx = self.context_by_id[ctx_id]
             timestamp = struct.timestamp
             timeout = struct.timeout
-
             if timestamp >= ctx.timestamp:
                 raise RuntimeError(f"invalid timestamp: {timestamp}") #synchronous execution
         elif nr == _ioctl_nr(kgsl.IOCTL_KGSL_DRAWCTXT_CREATE):
@@ -141,7 +138,6 @@ class QCOMDriver(VirtDriver):
             if ctx_id not in self.context_by_id: raise RuntimeError(f"invalid context id: {ctx_id}")
             del self.context_by_id[ctx_id]
         elif nr == _ioctl_nr(kgsl.IOCTL_KGSL_MAP_USER_MEM):
-            #mi = kgsl.IOCTL_KGSL_MAP_USER_MEM(self.fd, hostptr=ptr_aligned, len=size_aligned, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
             if struct.memtype != kgsl.KGSL_USER_MEM_TYPE_ADDR: raise NotImplementedError("Only KGSL_USER_MEM_TYPE_ADDR is supported")
             self.gpu.map_range(struct.hostptr+struct.offset, struct.len)
             struct.gpuaddr = struct.hostptr+struct.offset
@@ -185,3 +181,4 @@ class QCOMDriver(VirtDriver):
             ctx = self.context_by_id[ctx_id] #i.e., throw error if fails
             struct.timestamp = self.context_by_id[ctx_id].submit_command(struct.numcmds, struct.cmdlist, struct.cmdsize)
         else: raise NotImplementedError(f"{name} not implemented")
+        return 0
