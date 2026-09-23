@@ -1,6 +1,7 @@
 import time
 
 from test.mockgpu.gpu import VirtGPU
+from test.mockgpu.qcom.emu import run_asm
 from tinygrad.runtime.autogen import kgsl, mesa
 import ctypes
 
@@ -188,12 +189,50 @@ class QCOMGPU(VirtGPU):
                 payload[i] = self._read_word(inst_ptr)
             self._handle_pkt4(reg, cnt, payload)
         inst_ptr += ctypes.sizeof(ctypes.c_uint32)
-        return inst_ptr
-            
+        return inst_ptr        
 
     def _execute_cs(self, group_dims):
-        print("reached cs execution!")
-    
+        ndrange_reg = self.regs[mesa.REG_A6XX_SP_CS_NDRANGE_0]
+        kerneldim = (ndrange_reg & mesa.A6XX_SP_CS_NDRANGE_0_KERNELDIM__MASK) >> mesa.A6XX_SP_CS_NDRANGE_0_KERNELDIM__SHIFT
+        local_x = ((ndrange_reg & mesa.A6XX_SP_CS_NDRANGE_0_LOCALSIZEX__MASK) >> mesa.A6XX_SP_CS_NDRANGE_0_LOCALSIZEX__SHIFT) + 1
+        local_y = ((ndrange_reg & mesa.A6XX_SP_CS_NDRANGE_0_LOCALSIZEY__MASK) >> mesa.A6XX_SP_CS_NDRANGE_0_LOCALSIZEY__SHIFT) + 1
+        local_z = ((ndrange_reg & mesa.A6XX_SP_CS_NDRANGE_0_LOCALSIZEZ__MASK) >> mesa.A6XX_SP_CS_NDRANGE_0_LOCALSIZEZ__SHIFT) + 1
+        local_dims = (local_x, local_y, local_z)
+        #globaloffsets set to 0
+        globalsize_x = (self.regs[mesa.REG_A6XX_SP_CS_NDRANGE_1] & mesa.A6XX_SP_CS_NDRANGE_1_GLOBALSIZE_X__MASK) >> mesa.A6XX_SP_CS_NDRANGE_1_GLOBALSIZE_X__SHIFT
+        globalsize_y = (self.regs[mesa.REG_A6XX_SP_CS_NDRANGE_3] & mesa.A6XX_SP_CS_NDRANGE_3_GLOBALSIZE_Y__MASK) >> mesa.A6XX_SP_CS_NDRANGE_3_GLOBALSIZE_Y__SHIFT
+        globalsize_z = (self.regs[mesa.REG_A6XX_SP_CS_NDRANGE_5] & mesa.A6XX_SP_CS_NDRANGE_5_GLOBALSIZE_Z__MASK) >> mesa.A6XX_SP_CS_NDRANGE_5_GLOBALSIZE_Z__SHIFT
+        global_dims = (globalsize_x, globalsize_y, globalsize_z)
+        #global_offsets = (0, 0, 0)
+        cntl_reg_0 = self.regs[mesa.REG_A6XX_SP_CS_CNTL_0]
+        thread_size_enum = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__SHIFT
+        thread_size = 64
+        if thread_size_enum == mesa.THREAD128: thread_size = 128
+        # halfregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__SHIFT
+        # fullregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__SHIFT
+        # branchstack = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__MASK) >> mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__SHIFT
+        # cntl_reg_1 = self.regs[mesa.REG_A6XX_SP_CS_CNTL_1]
+        #above fields and those of cntl_reg_1 are somewhat irrelevant for our emulator
+        shader = self.state[(mesa.SB6_CS_SHADER, mesa.ST6_SHADER)]
+        shader_constants = self.state[(mesa.SB6_CS_SHADER, mesa.ST6_CONSTANTS)]
+        shader_uav = self.state.get((mesa.SB6_CS_SHADER, mesa.ST6_UAV), [])
+        shader_tex = self.state.get((mesa.SB6_CS_TEX, mesa.ST6_SHADER), [])
+        shader_tex_constants = self.state.get((mesa.SB6_CS_TEX, mesa.ST6_CONSTANTS), [])
+        const_config_reg = self.regs[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
+        wgidconstid = (const_config_reg & mesa.A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID__MASK) >> mesa.A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID__SHIFT
+        wgsizeconstid = (const_config_reg & mesa.A6XX_SP_CS_CONST_CONFIG_0_WGSIZECONSTID__MASK) >> mesa.A6XX_SP_CS_CONST_CONFIG_0_WGSIZECONSTID__SHIFT
+        wgoffsetconstid = (const_config_reg & mesa.A6XX_SP_CS_CONST_CONFIG_0_WGOFFSETCONSTID__MASK) >> mesa.A6XX_SP_CS_CONST_CONFIG_0_WGOFFSETCONSTID__SHIFT
+        localidregid = (const_config_reg & mesa.A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID__MASK) >> mesa.A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID__SHIFT
+        wge_cntl_reg = self.regs[mesa.REG_A6XX_SP_CS_WGE_CNTL]
+        linearlocalidregid = (wge_cntl_reg & mesa.A6XX_SP_CS_WGE_CNTL_LINEARLOCALIDREGID__MASK) >> mesa.A6XX_SP_CS_WGE_CNTL_LINEARLOCALIDREGID__SHIFT
+        run_asm(
+            shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
+            global_dims, group_dims, local_dims, kerneldim, thread_size,
+            wgidconstid, wgsizeconstid, wgoffsetconstid, localidregid, linearlocalidregid
+        )
+
+
+
     def submit_command(self, numcmds, cmdlist, cmdsize):
         cmd_struct = kgsl.struct_kgsl_command_object.from_address(cmdlist)
         if not cmd_struct.flags & kgsl.KGSL_CMDLIST_IB: raise NotImplementedError("Only KGSL_CMDLIST_IB is supported")
