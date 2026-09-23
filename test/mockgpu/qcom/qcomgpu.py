@@ -1,12 +1,24 @@
+import time
+
 from test.mockgpu.gpu import VirtGPU
-from tinygrad.runtime.autogen import kgsl
+from tinygrad.runtime.autogen import kgsl, mesa
 import ctypes
+
 
 class QCOMCommandObject:
     def __init__(self, numcmds, cmdlist, cmdsize):
         self.numcmds = numcmds
         self.cmdlist = cmdlist
         self.cmdsize = cmdsize
+
+class QCOMGPURegisters:
+    #admittedly overkill for what is just a dictionary wrapper, but just in case functionality needs to grow
+    def __init__(self):
+        self.regs = {}
+    def __getitem__(self, key):
+        return self.regs[key]
+    def __setitem__(self, key, value):
+        self.regs[key] = value
 
 class QCOMGPU(VirtGPU):
     def __init__(self, gpu_id):
@@ -20,18 +32,172 @@ class QCOMGPU(VirtGPU):
             "gpu_id": gpu_id,
             "gmem_sizebytes": 0x00100000
         }
+        self.state = {}
+        self.state_to_unit = {
+            (mesa.SB6_CS_SHADER, mesa.ST6_SHADER): 128,
+            (mesa.SB6_CS_SHADER, mesa.ST6_CONSTANTS): 16,
+            (mesa.SB6_CS_SHADER, mesa.ST6_UAV): 64,
+            (mesa.SB6_CS_TEX, mesa.ST6_SHADER): 16,
+            (mesa.SB6_CS_TEX, mesa.ST6_CONSTANTS): -1, #fixed size of 1600
+        }
+        self.cs_tex_const_size = 1600
         self.mapped_ranges = set()
         self.queue = []
+        self.regs = QCOMGPURegisters()
+
     def map_range(self, vaddr, size):
         self.mapped_ranges.add((vaddr, size))
     def unmap_range(self, vaddr, size):
         self.mapped_ranges.remove((vaddr, size))
+
+    def _decode_pkt7(self, pkt7):
+        # assert pkt7 & mesa.CP_TYPE7_PKT, f"Not a PKT7: {pkt7:#x}"
+        opcode = (pkt7 >> 16) & 0x7F
+        cnt = pkt7 & 0x3FFF
+        return opcode, cnt
+
+    def _decode_pkt4(self, pkt4):
+        # assert pkt4 & mesa.CP_TYPE4_PKT, f"Not a PKT4: {pkt4:#x}"
+        reg = (pkt4 >> 8) & 0x3FFFF
+        cnt = pkt4 & 0x7F
+        return reg, cnt
+
+    def _read_word(self, addr, signed=False):
+        if signed:
+            return ctypes.c_int32.from_address(addr).value
+        else:
+            return ctypes.c_uint32.from_address(addr).value
+
+    def _write_word(self, addr, value):
+        ptr = ctypes.cast(addr, ctypes.POINTER(ctypes.c_uint32))
+        ptr.contents.value = value
+
+    def _handle_pkt7(self, opcode, payload):
+        if opcode == mesa.CP_EVENT_WRITE:
+            event_code = (payload[0] & mesa.CP_EVENT_WRITE_0_EVENT__MASK) >> mesa.CP_EVENT_WRITE_0_EVENT__SHIFT
+            timestamp = (payload[0] & mesa.CP_EVENT_WRITE_0_TIMESTAMP) != 0
+            irq = (payload[0] & mesa.CP_EVENT_WRITE_0_IRQ) != 0
+            addr_low = (payload[1] & mesa.CP_EVENT_WRITE_1_ADDR_0_LO__MASK) >> mesa.CP_EVENT_WRITE_1_ADDR_0_LO__SHIFT
+            addr_high = (payload[2] & mesa.CP_EVENT_WRITE_2_ADDR_0_HI__MASK) >> mesa.CP_EVENT_WRITE_2_ADDR_0_HI__SHIFT
+            addr = (addr_high << 32) | addr_low
+            if timestamp or irq: raise NotImplementedError(f"CP_EVENT_WRITE with timestamp/irq flags set not implemented")
+            if event_code == mesa.CACHE_FLUSH_TS:
+                value = payload[3]
+                self._write_word(addr, value)
+            elif event_code == mesa.CACHE_INVALIDATE: pass #no observable effects
+            else: raise NotImplementedError(f"CP_EVENT_WRITE with event_code {event_code:#X} not implemented")
+        elif opcode == mesa.CP_WAIT_MEM_WRITES: pass
+        elif opcode == mesa.CP_WAIT_FOR_IDLE: pass
+        elif opcode == mesa.CP_REG_TO_MEM:
+            reg_code = (payload[0] & mesa.CP_REG_TO_MEM_0_REG__MASK) >> mesa.CP_REG_TO_MEM_0_REG__SHIFT
+            if reg_code == mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER:
+                clock = int(time.perf_counter()*19.2*1e6) #19.2 MHz for always_on_counter
+                self.regs[mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER] = clock & 0xFFFFFFFF
+                self.regs[mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER+1] = (clock >> 32) & 0xFFFFFFFF
+            cnt = (payload[0] & mesa.CP_REG_TO_MEM_0_CNT__MASK) >> mesa.CP_REG_TO_MEM_0_CNT__SHIFT
+            # _64b = (payload[0] & mesa.CP_REG_TO_MEM_0_64B) != 0
+            dest_addr_low = (payload[1] & mesa.CP_REG_TO_MEM_1_DEST_ADDR__MASK) >> mesa.CP_REG_TO_MEM_1_DEST_ADDR__SHIFT
+            dest_addr_high = (payload[2] & mesa.CP_REG_TO_MEM_2_DEST_ADDR_HI__MASK) >> mesa.CP_REG_TO_MEM_2_DEST_ADDR_HI__SHIFT
+            dest_addr = (dest_addr_high << 32) | dest_addr_low
+            for i in range(cnt):
+                reg_val = self.regs[reg_code + i]
+                self._write_word(dest_addr + i * ctypes.sizeof(ctypes.c_uint32), reg_val) #little endian, so we can ignore _64b flag, since treatment is identical
+        elif opcode == mesa.CP_WAIT_REG_MEM:
+            function_code = (payload[0] & mesa.CP_WAIT_REG_MEM_0_FUNCTION__MASK) >> mesa.CP_WAIT_REG_MEM_0_FUNCTION__SHIFT
+            signed_compare = (payload[0] & mesa.CP_WAIT_REG_MEM_0_SIGNED_COMPARE) != 0 #ignore, unused
+            poll_code = (payload[0] & mesa.CP_WAIT_REG_MEM_0_POLL__MASK) >> mesa.CP_WAIT_REG_MEM_0_POLL__SHIFT
+            poll_addr_low = (payload[1] & mesa.CP_WAIT_REG_MEM_1_POLL_ADDR_LO__MASK) >> mesa.CP_WAIT_REG_MEM_1_POLL_ADDR_LO__SHIFT
+            poll_addr_high = (payload[2] & mesa.CP_WAIT_REG_MEM_2_POLL_ADDR_HI__MASK) >> mesa.CP_WAIT_REG_MEM_2_POLL_ADDR_HI__SHIFT
+            poll_addr = (poll_addr_high << 32) | poll_addr_low
+            reference_code = (payload[3] & mesa.CP_WAIT_REG_MEM_3_REFERENCE__MASK) >> mesa.CP_WAIT_REG_MEM_3_REFERENCE__SHIFT
+            mask_code = (payload[4] & mesa.CP_WAIT_REG_MEM_4_MASK__MASK) >> mesa.CP_WAIT_REG_MEM_4_MASK__SHIFT
+            delay_cycles_code = (payload[5] & mesa.CP_WAIT_REG_MEM_5_DELAY_CYCLES__MASK) >> mesa.CP_WAIT_REG_MEM_5_DELAY_CYCLES__SHIFT #ignore
+            ref_val = reference_code & mask_code
+            if signed_compare:
+                ref_val = ctypes.c_int32(ref_val).value & mask_code
+            if poll_code == mesa.POLL_MEMORY:
+                poll_val = self._read_word(poll_addr, signed=signed_compare) & mask_code
+            elif poll_code == mesa.POLL_REG:
+                if signed_compare:
+                    poll_val = ctypes.c_int32(self.regs[poll_addr_low]).value & mask_code
+                else:
+                    poll_val = self.regs[poll_addr_low] & mask_code
+            else: raise NotImplementedError(f"CP_WAIT_REG_MEM with poll_code {poll_code:#X} not implemented")
+            success = False
+            if function_code == mesa.WRITE_EQ:
+                success = poll_val == ref_val
+            elif function_code == mesa.WRITE_GE:
+                success = poll_val >= ref_val
+            elif function_code == mesa.WRITE_GT:
+                success = poll_val > ref_val
+            elif function_code == mesa.WRITE_LE:
+                success = poll_val <= ref_val
+            elif function_code == mesa.WRITE_LT:
+                success = poll_val < ref_val
+            elif function_code == mesa.WRITE_NE:
+                success = poll_val != ref_val
+            else: raise RuntimeError(f"unknown function code {function_code:#X}")
+            if not success: raise RuntimeError("CP_WAIT_REG_MEM failed")
+        elif opcode == mesa.CP_SET_MARKER:
+            mode_code = (payload[0] & mesa.A6XX_CP_SET_MARKER_0_MODE__MASK) >> mesa.A6XX_CP_SET_MARKER_0_MODE__SHIFT
+            if mode_code != mesa.RM6_COMPUTE: raise NotImplementedError(f"CP_SET_MARKER with mode_code {mode_code:#X} not implemented")
+        elif opcode == mesa.CP_LOAD_STATE6_FRAG:
+            dst_off = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_DST_OFF__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_DST_OFF__SHIFT
+            if dst_off != 0: raise NotImplementedError(f"CP_LOAD_STATE6_FRAG with non-zero dst_off not implemented")
+            state_type_code = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_STATE_TYPE__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_STATE_TYPE__SHIFT
+            state_src_code = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_STATE_SRC__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_STATE_SRC__SHIFT
+            if state_src_code != mesa.SS6_INDIRECT: raise NotImplementedError(f"CP_LOAD_STATE6_FRAG with state_src_code {state_src_code:#X} not implemented")
+            state_block_code = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_STATE_BLOCK__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_STATE_BLOCK__SHIFT
+            num_unit = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_NUM_UNIT__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_NUM_UNIT__SHIFT
+            ext_src_addr_low = payload[1] & mesa.CP_LOAD_STATE6_FRAG_1_EXT_SRC_ADDR__MASK
+            ext_src_addr_high = (payload[2] & mesa.CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI__MASK) >> mesa.CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI__SHIFT
+            ext_src_addr = (ext_src_addr_high << 32) | ext_src_addr_low
+            read_ptr = ext_src_addr
+            data = []
+            num_words = num_unit * self.state_to_unit.get((state_block_code, state_type_code), 0) // 4 #bytes to words
+            if num_words == 0: raise NotImplementedError("CP_LOAD_STATE6_FRAG with unimplemented state_block_code/state_type_code combination")
+            if num_words < 0: num_words = self.cs_tex_const_size // 4 #fixed size (according to opencl_ioctl)
+            for i in range(num_words):
+                data.append(self._read_word(read_ptr))
+                read_ptr += ctypes.sizeof(ctypes.c_uint32)
+            self.state[(state_block_code, state_type_code)] = data
+        elif opcode == mesa.CP_EXEC_CS:
+            ngroups_x = (payload[1] & mesa.CP_EXEC_CS_0_NGROUPS_X__MASK) >> mesa.CP_EXEC_CS_0_NGROUPS_X__SHIFT
+            ngroups_y = (payload[2] & mesa.CP_EXEC_CS_0_NGROUPS_Y__MASK) >> mesa.CP_EXEC_CS_0_NGROUPS_Y__SHIFT
+            ngroups_z = (payload[3] & mesa.CP_EXEC_CS_0_NGROUPS_Z__MASK) >> mesa.CP_EXEC_CS_0_NGROUPS_Z__SHIFT
+            self._execute_cs((ngroups_x, ngroups_y, ngroups_z)) #all other info should be in registers and state
+        elif opcode == mesa.CP_RUN_OPENCL: raise NotImplementedError("Only CP_EXEC_CS supported for now (IR3Renderer)")
+        else: raise NotImplementedError(f"PKT7 opcode {opcode:#X} not implemented")
+        
+    def _decode_inst(self, inst_ptr):
+        inst = ctypes.c_uint32.from_address(inst_ptr).value
+        if inst & mesa.CP_TYPE7_PKT == mesa.CP_TYPE7_PKT:
+            opcode, cnt = self._decode_pkt7(inst)
+            payload = [0] * cnt
+            for i in range(cnt):
+                inst_ptr += ctypes.sizeof(ctypes.c_uint32)
+                payload[i] = self._read_word(inst_ptr)
+            self._handle_pkt7(opcode, payload)
+        elif inst & mesa.CP_TYPE4_PKT == mesa.CP_TYPE4_PKT:
+            reg, cnt = self._decode_pkt4(inst)
+            for i in range(cnt):
+                inst_ptr += ctypes.sizeof(ctypes.c_uint32)
+                payload = self._read_word(inst_ptr)
+                print(f"payload[{i}]: {payload:#x}")
+        inst_ptr += ctypes.sizeof(ctypes.c_uint32)
+        return inst_ptr
+            
+
+    def _execute_cs(self, group_dims):
+        raise NotImplementedError("execute_cs not implemented yet")
+    
     def submit_command(self, numcmds, cmdlist, cmdsize):
         cmd_struct = kgsl.struct_kgsl_command_object.from_address(cmdlist)
         if not cmd_struct.flags & kgsl.KGSL_CMDLIST_IB: raise NotImplementedError("Only KGSL_CMDLIST_IB is supported")
-        print(f"received {numcmds} commands, at gpu addr {cmd_struct.gpuaddr:#x}, each of size {cmd_struct.size:#x}")
-        # for i in range(numcmds):
-        #     cmd_obj = kgsl.struct_kgsl_command_object.from_address(cmdlist.gpuaddr + i * kgsl.struct_kgsl_ibdesc.SIZE)
-        #     print(f"  command {i}: gpuaddr={cmd_obj.gpuaddr:#x}")
         self.queue.append(QCOMCommandObject(numcmds, cmdlist, cmdsize))
+        inst_ptr = cmd_struct.gpuaddr
+        end_ptr = inst_ptr + cmd_struct.size
+
+        while inst_ptr < end_ptr:
+            inst_ptr = self._decode_inst(inst_ptr)
         return len(self.queue) - 1
