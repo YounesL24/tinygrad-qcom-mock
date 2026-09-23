@@ -168,6 +168,10 @@ class QCOMGPU(VirtGPU):
             self._execute_cs((ngroups_x, ngroups_y, ngroups_z)) #all other info should be in registers and state
         elif opcode == mesa.CP_RUN_OPENCL: raise NotImplementedError("Only CP_EXEC_CS supported for now (IR3Renderer)")
         else: raise NotImplementedError(f"PKT7 opcode {opcode:#X} not implemented")
+
+    def _handle_pkt4(self, reg, cnt, payload):
+        for i in range(cnt):
+            self.regs[reg + i] = payload[i]
         
     def _decode_inst(self, inst_ptr):
         inst = ctypes.c_uint32.from_address(inst_ptr).value
@@ -183,7 +187,7 @@ class QCOMGPU(VirtGPU):
             for i in range(cnt):
                 inst_ptr += ctypes.sizeof(ctypes.c_uint32)
                 payload = self._read_word(inst_ptr)
-                print(f"payload[{i}]: {payload:#x}")
+            self._handle_pkt4(reg, cnt, payload)
         inst_ptr += ctypes.sizeof(ctypes.c_uint32)
         return inst_ptr
             
