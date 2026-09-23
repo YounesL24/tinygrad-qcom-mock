@@ -51,13 +51,11 @@ class QCOMGPU(VirtGPU):
         self.mapped_ranges.remove((vaddr, size))
 
     def _decode_pkt7(self, pkt7):
-        # assert pkt7 & mesa.CP_TYPE7_PKT, f"Not a PKT7: {pkt7:#x}"
         opcode = (pkt7 >> 16) & 0x7F
         cnt = pkt7 & 0x3FFF
         return opcode, cnt
 
     def _decode_pkt4(self, pkt4):
-        # assert pkt4 & mesa.CP_TYPE4_PKT, f"Not a PKT4: {pkt4:#x}"
         reg = (pkt4 >> 8) & 0x3FFFF
         cnt = pkt4 & 0x7F
         return reg, cnt
@@ -77,11 +75,11 @@ class QCOMGPU(VirtGPU):
             event_code = (payload[0] & mesa.CP_EVENT_WRITE_0_EVENT__MASK) >> mesa.CP_EVENT_WRITE_0_EVENT__SHIFT
             timestamp = (payload[0] & mesa.CP_EVENT_WRITE_0_TIMESTAMP) != 0
             irq = (payload[0] & mesa.CP_EVENT_WRITE_0_IRQ) != 0
-            addr_low = (payload[1] & mesa.CP_EVENT_WRITE_1_ADDR_0_LO__MASK) >> mesa.CP_EVENT_WRITE_1_ADDR_0_LO__SHIFT
-            addr_high = (payload[2] & mesa.CP_EVENT_WRITE_2_ADDR_0_HI__MASK) >> mesa.CP_EVENT_WRITE_2_ADDR_0_HI__SHIFT
-            addr = (addr_high << 32) | addr_low
             if timestamp or irq: raise NotImplementedError(f"CP_EVENT_WRITE with timestamp/irq flags set not implemented")
             if event_code == mesa.CACHE_FLUSH_TS:
+                addr_low = (payload[1] & mesa.CP_EVENT_WRITE_1_ADDR_0_LO__MASK) >> mesa.CP_EVENT_WRITE_1_ADDR_0_LO__SHIFT
+                addr_high = (payload[2] & mesa.CP_EVENT_WRITE_2_ADDR_0_HI__MASK) >> mesa.CP_EVENT_WRITE_2_ADDR_0_HI__SHIFT
+                addr = (addr_high << 32) | addr_low
                 value = payload[3]
                 self._write_word(addr, value)
             elif event_code == mesa.CACHE_INVALIDATE: pass #no observable effects
@@ -109,10 +107,10 @@ class QCOMGPU(VirtGPU):
             poll_addr_low = (payload[1] & mesa.CP_WAIT_REG_MEM_1_POLL_ADDR_LO__MASK) >> mesa.CP_WAIT_REG_MEM_1_POLL_ADDR_LO__SHIFT
             poll_addr_high = (payload[2] & mesa.CP_WAIT_REG_MEM_2_POLL_ADDR_HI__MASK) >> mesa.CP_WAIT_REG_MEM_2_POLL_ADDR_HI__SHIFT
             poll_addr = (poll_addr_high << 32) | poll_addr_low
-            reference_code = (payload[3] & mesa.CP_WAIT_REG_MEM_3_REFERENCE__MASK) >> mesa.CP_WAIT_REG_MEM_3_REFERENCE__SHIFT
+            ref_code = (payload[3] & mesa.CP_WAIT_REG_MEM_3_REF__MASK) >> mesa.CP_WAIT_REG_MEM_3_REF__SHIFT
             mask_code = (payload[4] & mesa.CP_WAIT_REG_MEM_4_MASK__MASK) >> mesa.CP_WAIT_REG_MEM_4_MASK__SHIFT
-            delay_cycles_code = (payload[5] & mesa.CP_WAIT_REG_MEM_5_DELAY_CYCLES__MASK) >> mesa.CP_WAIT_REG_MEM_5_DELAY_CYCLES__SHIFT #ignore
-            ref_val = reference_code & mask_code
+            delay_cycles_code = (payload[5] & mesa.CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES__MASK) >> mesa.CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES__SHIFT #ignore
+            ref_val = ref_code & mask_code
             if signed_compare:
                 ref_val = ctypes.c_int32(ref_val).value & mask_code
             if poll_code == mesa.POLL_MEMORY:
@@ -142,15 +140,15 @@ class QCOMGPU(VirtGPU):
             mode_code = (payload[0] & mesa.A6XX_CP_SET_MARKER_0_MODE__MASK) >> mesa.A6XX_CP_SET_MARKER_0_MODE__SHIFT
             if mode_code != mesa.RM6_COMPUTE: raise NotImplementedError(f"CP_SET_MARKER with mode_code {mode_code:#X} not implemented")
         elif opcode == mesa.CP_LOAD_STATE6_FRAG:
-            dst_off = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_DST_OFF__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_DST_OFF__SHIFT
+            dst_off = (payload[0] & mesa.CP_LOAD_STATE6_0_DST_OFF__MASK) >> mesa.CP_LOAD_STATE6_0_DST_OFF__SHIFT
             if dst_off != 0: raise NotImplementedError(f"CP_LOAD_STATE6_FRAG with non-zero dst_off not implemented")
-            state_type_code = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_STATE_TYPE__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_STATE_TYPE__SHIFT
-            state_src_code = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_STATE_SRC__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_STATE_SRC__SHIFT
+            state_type_code = (payload[0] & mesa.CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> mesa.CP_LOAD_STATE6_0_STATE_TYPE__SHIFT
+            state_src_code = (payload[0] & mesa.CP_LOAD_STATE6_0_STATE_SRC__MASK) >> mesa.CP_LOAD_STATE6_0_STATE_SRC__SHIFT
             if state_src_code != mesa.SS6_INDIRECT: raise NotImplementedError(f"CP_LOAD_STATE6_FRAG with state_src_code {state_src_code:#X} not implemented")
-            state_block_code = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_STATE_BLOCK__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_STATE_BLOCK__SHIFT
-            num_unit = (payload[0] & mesa.CP_LOAD_STATE6_FRAG_0_NUM_UNIT__MASK) >> mesa.CP_LOAD_STATE6_FRAG_0_NUM_UNIT__SHIFT
-            ext_src_addr_low = payload[1] & mesa.CP_LOAD_STATE6_FRAG_1_EXT_SRC_ADDR__MASK
-            ext_src_addr_high = (payload[2] & mesa.CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI__MASK) >> mesa.CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI__SHIFT
+            state_block_code = (payload[0] & mesa.CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> mesa.CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT
+            num_unit = (payload[0] & mesa.CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> mesa.CP_LOAD_STATE6_0_NUM_UNIT__SHIFT
+            ext_src_addr_low = payload[1] & mesa.CP_LOAD_STATE6_1_EXT_SRC_ADDR__MASK
+            ext_src_addr_high = (payload[2] & mesa.CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI__MASK) >> mesa.CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI__SHIFT
             ext_src_addr = (ext_src_addr_high << 32) | ext_src_addr_low
             read_ptr = ext_src_addr
             data = []
@@ -162,9 +160,9 @@ class QCOMGPU(VirtGPU):
                 read_ptr += ctypes.sizeof(ctypes.c_uint32)
             self.state[(state_block_code, state_type_code)] = data
         elif opcode == mesa.CP_EXEC_CS:
-            ngroups_x = (payload[1] & mesa.CP_EXEC_CS_0_NGROUPS_X__MASK) >> mesa.CP_EXEC_CS_0_NGROUPS_X__SHIFT
-            ngroups_y = (payload[2] & mesa.CP_EXEC_CS_0_NGROUPS_Y__MASK) >> mesa.CP_EXEC_CS_0_NGROUPS_Y__SHIFT
-            ngroups_z = (payload[3] & mesa.CP_EXEC_CS_0_NGROUPS_Z__MASK) >> mesa.CP_EXEC_CS_0_NGROUPS_Z__SHIFT
+            ngroups_x = (payload[1] & mesa.CP_EXEC_CS_1_NGROUPS_X__MASK) >> mesa.CP_EXEC_CS_1_NGROUPS_X__SHIFT
+            ngroups_y = (payload[2] & mesa.CP_EXEC_CS_2_NGROUPS_Y__MASK) >> mesa.CP_EXEC_CS_2_NGROUPS_Y__SHIFT
+            ngroups_z = (payload[3] & mesa.CP_EXEC_CS_3_NGROUPS_Z__MASK) >> mesa.CP_EXEC_CS_3_NGROUPS_Z__SHIFT
             self._execute_cs((ngroups_x, ngroups_y, ngroups_z)) #all other info should be in registers and state
         elif opcode == mesa.CP_RUN_OPENCL: raise NotImplementedError("Only CP_EXEC_CS supported for now (IR3Renderer)")
         else: raise NotImplementedError(f"PKT7 opcode {opcode:#X} not implemented")
@@ -184,24 +182,24 @@ class QCOMGPU(VirtGPU):
             self._handle_pkt7(opcode, payload)
         elif inst & mesa.CP_TYPE4_PKT == mesa.CP_TYPE4_PKT:
             reg, cnt = self._decode_pkt4(inst)
+            payload = [0] * cnt
             for i in range(cnt):
                 inst_ptr += ctypes.sizeof(ctypes.c_uint32)
-                payload = self._read_word(inst_ptr)
+                payload[i] = self._read_word(inst_ptr)
             self._handle_pkt4(reg, cnt, payload)
         inst_ptr += ctypes.sizeof(ctypes.c_uint32)
         return inst_ptr
             
 
     def _execute_cs(self, group_dims):
-        raise NotImplementedError("execute_cs not implemented yet")
+        print("reached cs execution!")
     
     def submit_command(self, numcmds, cmdlist, cmdsize):
         cmd_struct = kgsl.struct_kgsl_command_object.from_address(cmdlist)
         if not cmd_struct.flags & kgsl.KGSL_CMDLIST_IB: raise NotImplementedError("Only KGSL_CMDLIST_IB is supported")
-        self.queue.append(QCOMCommandObject(numcmds, cmdlist, cmdsize))
+        self.queue.append(QCOMCommandObject(numcmds, cmdlist, cmdsize)) #kind of irrelevant
         inst_ptr = cmd_struct.gpuaddr
         end_ptr = inst_ptr + cmd_struct.size
-
         while inst_ptr < end_ptr:
             inst_ptr = self._decode_inst(inst_ptr)
-        return len(self.queue) - 1
+        return len(self.queue) - 1 #TODO: probably change ret value
