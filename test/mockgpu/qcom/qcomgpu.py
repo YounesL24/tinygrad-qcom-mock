@@ -205,13 +205,17 @@ class QCOMGPU(VirtGPU):
         global_dims = (globalsize_x, globalsize_y, globalsize_z)
         #global_offsets = (0, 0, 0)
         cntl_reg_0 = self.regs[mesa.REG_A6XX_SP_CS_CNTL_0]
-        thread_size_enum = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__SHIFT
-        thread_size = 64
-        if thread_size_enum == mesa.THREAD128: thread_size = 128
+        wave_size_enum = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__SHIFT
+        wave_size = 64
+        if wave_size_enum == mesa.THREAD128: wave_size = 128
         # halfregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__SHIFT
         # fullregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__SHIFT
         # branchstack = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__MASK) >> mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__SHIFT
-        # cntl_reg_1 = self.regs[mesa.REG_A6XX_SP_CS_CNTL_1]
+        cntl_reg_1 = self.regs[mesa.REG_A6XX_SP_CS_CNTL_1]
+        shared_memsize = (cntl_reg_1 & mesa.A6XX_SP_CS_CNTL_1_SHAREDSIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_1_SHAREDSIZE__SHIFT
+        pvt_mem_param_reg = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM]
+        pvt_memsize_peritem = (pvt_mem_param_reg & mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK) >> mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__SHIFT
+        pvt_mem_base = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_BASE] 
         #above fields and those of cntl_reg_1 are somewhat irrelevant for our emulator
         shader = self.state[(mesa.SB6_CS_SHADER, mesa.ST6_SHADER)]
         shader_constants = self.state[(mesa.SB6_CS_SHADER, mesa.ST6_CONSTANTS)]
@@ -227,7 +231,8 @@ class QCOMGPU(VirtGPU):
         linearlocalidregid = (wge_cntl_reg & mesa.A6XX_SP_CS_WGE_CNTL_LINEARLOCALIDREGID__MASK) >> mesa.A6XX_SP_CS_WGE_CNTL_LINEARLOCALIDREGID__SHIFT
         run_asm(
             shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
-            global_dims, group_dims, local_dims, kerneldim, thread_size,
+            global_dims, group_dims, local_dims, kerneldim, wave_size,
+            shared_memsize, pvt_memsize_peritem, pvt_mem_base,
             wgidconstid, wgsizeconstid, wgoffsetconstid, localidregid, linearlocalidregid
         )
 
