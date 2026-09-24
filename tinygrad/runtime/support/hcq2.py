@@ -90,7 +90,7 @@ def cfunc_buf(lib:str, name:str) -> Buffer:
 def fncall_ptr(fn:Any, ptr:Any, *args:UOp|int) -> UOp:
   ptr_uop = UOp.const(ctypes.cast(ptr, ctypes.c_void_p).value, dtypes.uint64)
   cargs = [UOp.const(a, dtypes.int) if isinstance(a, int) else a for a in args]
-  return UOp.custom_function(fn.__name__, ptr_uop).call(*cargs)
+  return UOp.custom_function(fn.__name__).call(*([ptr_uop] + cargs))
 
 def ccall(fn:Any, *args:UOp|int) -> UOp:
   ptr = UOp.placeholder((1,), dtypes.uint64, 0, device=HCQ_RUNTIME_DEV.value, tag=("cfunc", fn.__module__.split(".")[-1], fn.__name__))

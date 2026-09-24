@@ -61,8 +61,8 @@ class PythonProgram(Program['PythonDevice']):
       i = 0
       while i < len(self.uops):
         u = self.uops[i]
-        src_values = [values[v] for v in u.src if v.dtype is not dtypes.void or (u.op is Ops.CALL and v.op is Ops.CUSTOM_FUNCTION)]
-        src_dtypes = [v.dtype for v in u.src if v.dtype is not dtypes.void or (u.op is Ops.CALL and v.op is Ops.CUSTOM_FUNCTION)]
+        src_values = [values[v] for v in u.src if v.dtype is not dtypes.void]
+        src_dtypes = [v.dtype for v in u.src if v.dtype is not dtypes.void]
         if getenv("TRACE"): print(i, u.op, u.dtype, u.arg, src_values, src_dtypes)
         if u.op is Ops.BACKEDGE:
           i = self.uop_to_index[u.src[1]] if values[u.src[2]][0] else i+1
