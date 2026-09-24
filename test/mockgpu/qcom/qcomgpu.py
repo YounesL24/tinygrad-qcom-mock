@@ -212,7 +212,7 @@ class QCOMGPU(VirtGPU):
         # fullregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__SHIFT
         # branchstack = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__MASK) >> mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__SHIFT
         cntl_reg_1 = self.regs[mesa.REG_A6XX_SP_CS_CNTL_1]
-        shared_memsize = (cntl_reg_1 & mesa.A6XX_SP_CS_CNTL_1_SHAREDSIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_1_SHAREDSIZE__SHIFT
+        shared_memsize = (cntl_reg_1 & mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__SHIFT
         pvt_mem_param_reg = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM]
         pvt_memsize_peritem = (pvt_mem_param_reg & mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK) >> mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__SHIFT
         pvt_mem_base = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_BASE] 

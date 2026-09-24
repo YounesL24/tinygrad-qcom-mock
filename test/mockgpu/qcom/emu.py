@@ -1,4 +1,5 @@
 import ctypes
+from dataclasses import dataclass
 import functools
 import itertools
 import math
@@ -14,30 +15,47 @@ from tinygrad.dtype import dtypes
 
 def _c(val, dtype=dtypes.uint32): return UOp.const(val, dtype)
 
+@dataclass(frozen=True)
 class Inst:
     ...
+        
+        
 
 class _Ctx:
-    ...
+    def __init__(self):
+        return
 
 def _compile_inst(inst, ctx):
     ...
 
-_canonical_runner_cache: dict[Inst, (UOp, object)] = {}  # [(inst, (prg, runtime))]
-
 @functools.cache
 def _get_runner(inst):
-    if _canonical_runner_cache.get(inst, None) is not None: return _canonical_runner_cache[inst]
-    ctx = _Ctx(...) #TODO: tbd
+    ctx = _Ctx() #TODO: tbd
     sink = _compile_inst(inst, ctx)
     with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
         prg = to_program(sink, Device['CPU'].renderer)
         runtime = get_runtime('CPU', prg)
-    _canonical_runner_cache[inst] = (prg, runtime)
     return prg, runtime
 def _decode_inst(inst_code):
     #TODO: create instruction class and decode based on bits
-    ...
+    category = (inst_code >> 61) & 0x7
+    if category == 0:
+        immediate = inst_code & 0xFFFFFFFF
+        repeat = (inst_code >> 40) & 0x7
+        ss = (inst_code >> 44) & 0x1
+        eq = (inst_code >> 48) & 0x1
+        jp = (inst_code >> 59) & 0x1
+        sy = (inst_code >> 60) & 0x1
+
+    elif category == 1: pass
+    elif category == 2: pass
+    elif category == 3: pass
+    elif category == 4: pass
+    elif category == 5: pass
+    elif category == 6: pass
+    elif category == 7: pass
+    else: raise RuntimeError(f"Invalid instruction category: {category}")
+    return Inst(inst_code)
 
 def _decode_at(pc, shader):
     inst_low = shader[pc]
@@ -100,9 +118,19 @@ class WaveState:
 
 def _init_wave(
     shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
-    wave_start, total_threads, local_dims, pvt_memsize_peritem
+    wave_start, wave_size, total_threads, local_dims, pvt_memsize_peritem,
+    wgidconstid, wgsizeconstid, localidregid, group_id, group_dims
 ):
-    return
+    return WaveState(
+        wave_size=wave_size,
+        wave_idx=wave_start // wave_size,
+        wgidconstid=wgidconstid,
+        wgsizeconstid=wgsizeconstid,
+        localidregid=localidregid,
+        wgid=group_id,
+        wgsize=group_dims,
+        local_dims=local_dims
+    )
 
 def run_asm(
     shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
@@ -129,9 +157,9 @@ def run_asm(
             is_barrier = ... #TODO: determine barrier instructions
             program[pc] = (runtime.fxn, prg.arg.globals, is_barrier, inst)
             if DEBUG >= 3:
-                prev_len = len(_canonical_runner_cache)
+                prev_len = _get_runner.cache_info().currsize
                 msg = f"[emu] PC={pc}: {inst!r}"
-                print(colored(msg, 'green') if len(_canonical_runner_cache) > prev_len else msg)
+                print(colored(msg, 'green') if _get_runner.cache_info().currsize > prev_len else msg)
         return program[pc]
 
     def _run_workgroup(group_id):
@@ -139,7 +167,8 @@ def run_asm(
         for wave_start in range(0, total_threads, wave_size):
             st = _init_wave(
                 shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
-                wave_start, total_threads, local_dims, pvt_memsize_peritem
+                wave_start, wave_size, total_threads, local_dims, pvt_memsize_peritem,
+                wgidconstid, wgsizeconstid, localidregid, group_id, group_dims
             )
             waves.append(
                 (st,
@@ -157,6 +186,7 @@ def run_asm(
                 if done[wi]: continue
                 for _ in range(1_000_000):
                     pc = st.pc
+                    st.pc += 2 #each instruction is 2 words
                     fxn, globals_list, is_barrier, inst = _ensure_compiled(pc)    
                     #TODO done detection? probably using end opcode, or instruction list size
                     if DEBUG >= 5: print(f"  exec gid=({group_id[0]},{group_id[1]},{group_id[2]}) w={wi} PC={pc}: {inst!r}", flush=True)
@@ -168,6 +198,3 @@ def run_asm(
 
     for gidz, gidy, gidx in itertools.product(range(group_z), range(group_y), range(group_x)):
         _run_workgroup((gidx, gidy, gidz))
-
-
-
