@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 import time
 
 from test.mockgpu.gpu import VirtGPU
@@ -76,7 +77,7 @@ class QCOMGPU(VirtGPU):
             event_code = (payload[0] & mesa.CP_EVENT_WRITE_0_EVENT__MASK) >> mesa.CP_EVENT_WRITE_0_EVENT__SHIFT
             timestamp = (payload[0] & mesa.CP_EVENT_WRITE_0_TIMESTAMP) != 0
             irq = (payload[0] & mesa.CP_EVENT_WRITE_0_IRQ) != 0
-            if timestamp or irq: raise NotImplementedError(f"CP_EVENT_WRITE with timestamp/irq flags set not implemented")
+            if timestamp or irq: raise NotImplementedError("CP_EVENT_WRITE with timestamp/irq flags set not implemented")
             if event_code == mesa.CACHE_FLUSH_TS:
                 addr_low = (payload[1] & mesa.CP_EVENT_WRITE_1_ADDR_0_LO__MASK) >> mesa.CP_EVENT_WRITE_1_ADDR_0_LO__SHIFT
                 addr_high = (payload[2] & mesa.CP_EVENT_WRITE_2_ADDR_0_HI__MASK) >> mesa.CP_EVENT_WRITE_2_ADDR_0_HI__SHIFT
@@ -95,8 +96,8 @@ class QCOMGPU(VirtGPU):
                 self.regs[mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER+1] = (clock >> 32) & 0xFFFFFFFF
             cnt = (payload[0] & mesa.CP_REG_TO_MEM_0_CNT__MASK) >> mesa.CP_REG_TO_MEM_0_CNT__SHIFT
             # _64b = (payload[0] & mesa.CP_REG_TO_MEM_0_64B) != 0
-            dest_addr_low = (payload[1] & mesa.CP_REG_TO_MEM_1_DEST_ADDR__MASK) >> mesa.CP_REG_TO_MEM_1_DEST_ADDR__SHIFT
-            dest_addr_high = (payload[2] & mesa.CP_REG_TO_MEM_2_DEST_ADDR_HI__MASK) >> mesa.CP_REG_TO_MEM_2_DEST_ADDR_HI__SHIFT
+            dest_addr_low = (payload[1] & mesa.CP_REG_TO_MEM_1_DEST__MASK) >> mesa.CP_REG_TO_MEM_1_DEST__SHIFT
+            dest_addr_high = (payload[2] & mesa.CP_REG_TO_MEM_2_DEST_HI__MASK) >> mesa.CP_REG_TO_MEM_2_DEST_HI__SHIFT
             dest_addr = (dest_addr_high << 32) | dest_addr_low
             for i in range(cnt):
                 reg_val = self.regs[reg_code + i]
@@ -110,13 +111,12 @@ class QCOMGPU(VirtGPU):
             poll_addr = (poll_addr_high << 32) | poll_addr_low
             ref_code = (payload[3] & mesa.CP_WAIT_REG_MEM_3_REF__MASK) >> mesa.CP_WAIT_REG_MEM_3_REF__SHIFT
             mask_code = (payload[4] & mesa.CP_WAIT_REG_MEM_4_MASK__MASK) >> mesa.CP_WAIT_REG_MEM_4_MASK__SHIFT
-            delay_cycles_code = (payload[5] & mesa.CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES__MASK) >> mesa.CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES__SHIFT #ignore
             ref_val = ref_code & mask_code
             if signed_compare:
                 ref_val = ctypes.c_int32(ref_val).value & mask_code
             if poll_code == mesa.POLL_MEMORY:
                 poll_val = self._read_word(poll_addr, signed=signed_compare) & mask_code
-            elif poll_code == mesa.POLL_REG:
+            elif poll_code == mesa.POLL_REGISTER:
                 if signed_compare:
                     poll_val = ctypes.c_int32(self.regs[poll_addr_low]).value & mask_code
                 else:
@@ -142,7 +142,7 @@ class QCOMGPU(VirtGPU):
             if mode_code != mesa.RM6_COMPUTE: raise NotImplementedError(f"CP_SET_MARKER with mode_code {mode_code:#X} not implemented")
         elif opcode == mesa.CP_LOAD_STATE6_FRAG:
             dst_off = (payload[0] & mesa.CP_LOAD_STATE6_0_DST_OFF__MASK) >> mesa.CP_LOAD_STATE6_0_DST_OFF__SHIFT
-            if dst_off != 0: raise NotImplementedError(f"CP_LOAD_STATE6_FRAG with non-zero dst_off not implemented")
+            if dst_off != 0: raise NotImplementedError("CP_LOAD_STATE6_FRAG with non-zero dst_off not implemented")
             state_type_code = (payload[0] & mesa.CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> mesa.CP_LOAD_STATE6_0_STATE_TYPE__SHIFT
             state_src_code = (payload[0] & mesa.CP_LOAD_STATE6_0_STATE_SRC__MASK) >> mesa.CP_LOAD_STATE6_0_STATE_SRC__SHIFT
             if state_src_code != mesa.SS6_INDIRECT: raise NotImplementedError(f"CP_LOAD_STATE6_FRAG with state_src_code {state_src_code:#X} not implemented")
@@ -171,7 +171,7 @@ class QCOMGPU(VirtGPU):
     def _handle_pkt4(self, reg, cnt, payload):
         for i in range(cnt):
             self.regs[reg + i] = payload[i]
-        
+
     def _decode_inst(self, inst_ptr):
         inst = ctypes.c_uint32.from_address(inst_ptr).value
         if inst & mesa.CP_TYPE7_PKT == mesa.CP_TYPE7_PKT:
@@ -189,7 +189,7 @@ class QCOMGPU(VirtGPU):
                 payload[i] = self._read_word(inst_ptr)
             self._handle_pkt4(reg, cnt, payload)
         inst_ptr += ctypes.sizeof(ctypes.c_uint32)
-        return inst_ptr        
+        return inst_ptr
 
     def _execute_cs(self, group_dims):
         ndrange_reg = self.regs[mesa.REG_A6XX_SP_CS_NDRANGE_0]
@@ -208,6 +208,7 @@ class QCOMGPU(VirtGPU):
         wave_size_enum = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_0_THREADSIZE__SHIFT
         wave_size = 64
         if wave_size_enum == mesa.THREAD128: wave_size = 128
+        mergedregs = bool(cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_MERGEDREGS)  # half regs alias the halves of full regs only when set
         # halfregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__SHIFT
         # fullregfootprint = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__SHIFT
         # branchstack = (cntl_reg_0 & mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__MASK) >> mesa.A6XX_SP_CS_CNTL_0_BRANCHSTACK__SHIFT
@@ -215,7 +216,7 @@ class QCOMGPU(VirtGPU):
         shared_memsize = (cntl_reg_1 & mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__MASK) >> mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__SHIFT
         pvt_mem_param_reg = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM]
         pvt_memsize_peritem = (pvt_mem_param_reg & mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK) >> mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__SHIFT
-        pvt_mem_base = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_BASE] 
+        pvt_mem_base = self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_BASE]
         #above fields and those of cntl_reg_1 are somewhat irrelevant for our emulator
         shader = self.state[(mesa.SB6_CS_SHADER, mesa.ST6_SHADER)]
         shader_constants = self.state[(mesa.SB6_CS_SHADER, mesa.ST6_CONSTANTS)]
@@ -233,10 +234,8 @@ class QCOMGPU(VirtGPU):
             shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
             global_dims, group_dims, local_dims, kerneldim, wave_size,
             shared_memsize, pvt_memsize_peritem, pvt_mem_base,
-            wgidconstid, wgsizeconstid, wgoffsetconstid, localidregid, linearlocalidregid
+            wgidconstid, wgsizeconstid, wgoffsetconstid, localidregid, linearlocalidregid, mergedregs
         )
-
-
 
     def submit_command(self, numcmds, cmdlist, cmdsize):
         cmd_struct = kgsl.struct_kgsl_command_object.from_address(cmdlist)

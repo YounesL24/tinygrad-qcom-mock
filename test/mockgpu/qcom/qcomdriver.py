@@ -3,17 +3,16 @@ import functools
 
 from test.mockgpu.driver import TextFileDesc, VirtDriver, VirtFile, VirtFileDesc
 
-from test.mockgpu.qcom.qcomgpu import QCOMGPU, QCOMCommandObject
+from test.mockgpu.qcom.qcomgpu import QCOMGPU
 from tinygrad.runtime.autogen import kgsl
 
-import functools
 
 _UINT_MAX = (1 << (8*ctypes.sizeof(ctypes.c_uint))) - 1
 
 def _ioctl_nr(ioctl: functools.partial) -> int: return ioctl.args[2]
 
 kgsl_ioctl_info = {
-    _ioctl_nr(ioctl): (name ,ioctl.args[3]) for name, ioctl in vars(kgsl).items()
+    _ioctl_nr(ioctl): (name,ioctl.args[3]) for name, ioctl in vars(kgsl).items()
     if name.startswith("IOCTL_KGSL_") and isinstance(ioctl, functools.partial)
 }
 
@@ -26,8 +25,6 @@ class KGSLFileDesc(VirtFileDesc):
         obj_id = offset // 0x1000
         if obj_id not in self.driver.object_by_id: raise RuntimeError(f"invalid object id: {obj_id}")
         return self.driver.object_by_id[obj_id].vaddr
-
-
 
 
 class QCOMContext:
@@ -62,7 +59,7 @@ class QCOMContext:
         self.submissions[allocated_timestamp] = cmd_ids
         self.timestamp += 1
         return allocated_timestamp
-        
+
 
 class QCOMObject:
     def __init__(self, vaddr, data, size):
@@ -82,7 +79,7 @@ class QCOMDriver(VirtDriver):
 
         self.next_ctx_id = 1
         self.context_by_id = {}
-        
+
         self.next_obj_id = 1
         self.object_by_id = {}
 
@@ -97,7 +94,7 @@ class QCOMDriver(VirtDriver):
             out[4-i-1] = (request >> (i * 8)) & 0xFF
         return out
     def kgsl_ioctl(self, request, argp):
-        (dir, size, typ, nr) = self._decode_request(request)
+        (_, _, typ, nr) = self._decode_request(request)
         assert typ == 0x09, "Expected type 0x09 for KGSL ioctl"
 
         if nr not in kgsl_ioctl_info: raise RuntimeError(f"unknown kgsl ioctl, {nr} unknown")
@@ -123,7 +120,6 @@ class QCOMDriver(VirtDriver):
             if ctx_id not in self.context_by_id: raise RuntimeError(f"invalid context id: {ctx_id}")
             ctx = self.context_by_id[ctx_id]
             timestamp = struct.timestamp
-            timeout = struct.timeout
             if timestamp >= ctx.timestamp:
                 raise RuntimeError(f"invalid timestamp: {timestamp}") #synchronous execution
         elif nr == _ioctl_nr(kgsl.IOCTL_KGSL_DRAWCTXT_CREATE):
@@ -161,7 +157,7 @@ class QCOMDriver(VirtDriver):
             if size == 0 or size > _UINT_MAX: raise RuntimeError(f"size: {size} out of range (0, UINT_MAX]")
             flags = struct.flags
             # ignore va_len, metadata, unused
-            if not (flags & kgsl.KGSL_MEMFLAGS_USE_CPU_MAP): raise NotImplementedError("Only KGSL_MEMFLAGS_USE_CPU_MAP is supported") 
+            if not (flags & kgsl.KGSL_MEMFLAGS_USE_CPU_MAP): raise NotImplementedError("Only KGSL_MEMFLAGS_USE_CPU_MAP is supported")
             data = bytearray(size) #map to cpu address, then map to gpu too
             vaddr = ctypes.addressof(ctypes.c_char.from_buffer(data))
             self.gpu.map_range(vaddr, size)
