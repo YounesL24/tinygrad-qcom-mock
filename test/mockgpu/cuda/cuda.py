@@ -62,6 +62,7 @@ def cuMemFree_v2(dptr): return free(dptr)
 def cuMemFreeHost(p): return free(p)
 def cuMemHostRegister_v2(p, size, flags): return cuda.CUDA_SUCCESS
 def cuMemHostUnregister(p): return cuda.CUDA_SUCCESS
+def cuMemHostGetDevicePointer_v2(pdptr, p, flags): return out(pdptr, p)
 
 def cuModuleLoadData(module, image):
   modules.append(ctypes.create_string_buffer(ctypes.string_at(image)))
@@ -78,3 +79,4 @@ def cuStreamWaitValue64_v2(stream, address, value, flags): return enqueue(stream
 
 for name, fn in list(globals().items()):
   if name.startswith("cu") and callable(fn): setattr(cuda.dll, name, ctypes.CFUNCTYPE(getattr(cuda, name).restype, *getattr(cuda, name).argtypes)(fn))
+cuda.dll._loaded_[cuda.dll.nm] = cuda.dll

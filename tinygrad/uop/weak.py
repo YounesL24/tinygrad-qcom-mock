@@ -2,6 +2,7 @@ from dataclasses import replace
 from tinygrad.dtype import dtypes, DType, AddrSpace, Invalid, least_upper_dtype, strong_dtype, weak_dtype
 
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, GroupOp, dtype_from_uop, promo_dtype
+from tinygrad.helpers import is_image_shape
 
 # the decomps and float emulation commit bare consts at a dtype another src already states
 def commit_weak_consts(u:UOp, dt:DType|None) -> UOp:
@@ -64,7 +65,14 @@ def lower_weak_node(u:UOp) -> UOp|None:
   src = src[:start]+tuple(s if s.base.is_invalid or s.dtype in dtypes.weaks else s.ccast(dt) for s in src[start:])
   return u.replace(src=src).cast(u.dtype)
 
+def narrow_image_coord(c:UOp) -> UOp:
+  if (idx:=c.get_idx()).dtype is not dtypes.long: return c
+  return idx.cast(dtypes.int) if idx is c else idx.cast(dtypes.int).valid(c.get_valid())
+
 pm_lower_weak = PatternMatcher([
+  # a long image coordinate narrows, image reads and writes take int coordinates
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("y"), UPat.var("x")), name="u"), lambda u,buf,y,x:
+   u.replace(src=(buf, narrow_image_coord(y), narrow_image_coord(x))) if is_image_shape(buf._shape) else None),
   # a gated long index into a small buffer narrows; its out-of-gate value is discarded
   (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("gate").where(UPat.var("idx", dtypes.long), UPat(Ops.CONST, arg=Invalid))),
         allow_any_len=True, name="u"),
@@ -72,9 +80,9 @@ pm_lower_weak = PatternMatcher([
   # two stacked weak casts are two kind conversions: each resolves at its own kind's default
   (UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat.var("x"),)),), name="u"),
    lambda u,x: x.cast(u.src[0].commit_dtype(dtypes.int)).cast(u.commit_dtype(dtypes.int)).cast(u.dtype) if x.dtype not in dtypes.weaks else None),
-  (UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC), dtype=dtypes.weakint, name="u"),
+  (UPat(Ops.PARAM, dtype=dtypes.weakint, name="u"),
     lambda u: u.replace(arg=replace(u.arg, dtype=u.commit_dtype(dtypes.int))).cast(dtypes.weakint) if u.addrspace == AddrSpace.ALU else None),
-  (UPat(GroupOp.All, name="u"), lower_weak_node),
+  (UPat(GroupOp.All-GroupOp.Defines, name="u"), lower_weak_node),
 ])
 
 # drop the CAST off a committed const where the consumer re-derives it anyway, so bare-CONST rules keep matching.
@@ -95,4 +103,4 @@ def cast_consts(u:UOp) -> UOp|None:
   # .cast folds at the dtypes a bare CONST derives, so the width is forced. Invalid never commits.
   return u.replace(src=tuple(UOp.cconst(s.val, s.commit_dtype(dtypes.int)) if s.op is Ops.CONST and not s.is_invalid else s for s in u.src))
 
-pm_cast_const = PatternMatcher([(UPat(GroupOp.All, name="u", custom_early_reject={Ops.CONST}), cast_consts)])
+pm_cast_const = PatternMatcher([(UPat(GroupOp.All-GroupOp.Defines, name="u", custom_early_reject={Ops.CONST}), cast_consts)])

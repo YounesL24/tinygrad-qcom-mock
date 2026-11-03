@@ -1,10 +1,12 @@
 import unittest, itertools
+from dataclasses import replace
 
-from tinygrad.codegen.late.coalesce import indexing_simplify
+from tinygrad.codegen.late.coalesce import indexing_simplify, pm_simplify_add_image
+from tinygrad import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite
 from tinygrad.uop.weak import pm_commit_weak
-from tinygrad.uop.symbolic import simplify_valid, sym, pm_move_where_on_load
+from tinygrad.uop.symbolic import simplify_valid, uop_given_valid, sym, pm_move_where_on_load
 from tinygrad.helpers import Context
 from test.helpers import full_rewrite
 from test.null.test_uop_symbolic import check_uop_against_string
@@ -21,7 +23,7 @@ def get_load_image_uop(image_shape:tuple[int, ...], valid:UOp, idx:tuple[UOp, UO
   return UOp.param(0, dtypes.float, image_shape).index(idx[1].valid(valid), idx[0].valid(valid)).load()
 
 def Special(expr, nmax): return UOp.special(nmax, expr)
-def Variable(expr, nmin, nmax): return UOp.variable(expr, nmin, nmax, param=True)
+def Variable(expr, nmin, nmax): return UOp.variable(expr, nmin, nmax)
 def Range(n, nmax): return UOp.range(nmax, n)
 
 class TestValidIdxSimplification(unittest.TestCase):
@@ -60,9 +62,16 @@ class TestValidIdxSimplification(unittest.TestCase):
     valid = (alu0 < 57) & (alu0 >= 1)
     self.assertIsNone(simplify_valid(valid))
 
+  def test_simplex_const_term_keeps_lanes_aligned(self):
+    # the 1 in the valid is not a simplex variable, lane +1 must simplify like the other lanes
+    a, b, c, d = Variable("a", 0, 7), Variable("b", 0, 7), Variable("c", 0, 3), Variable("d", 0, 1)
+    valid = ((a+b+1)<1).ne(True) & ((c+d)<1).ne(True)
+    base = ((a*8+b+c*128+d*64+1000)%1024)*4
+    self.assertTrue(all(uop_given_valid(valid, base+k).src[0] is uop_given_valid(valid, base+0).src[0] for k in range(1, 4)))
+
   def test_bitwise_and_is_not_a_valid(self):
     ridx0 = Range(0, 16)
-    self.assertEqual(simplify_valid_idx(UOp.sink((ridx0 & UOp.const(12, dtypes.int)) & ridx0)).src[0].render(), "((int)(r0)&12&(int)(r0))")
+    self.assertEqual(simplify_valid_idx(UOp.sink((ridx0 & UOp.const(12, dtypes.int)) & ridx0)).src[0].render(), "((i32)(r0)&12&(i32)(r0))")
 
   def test_valid_order_matters1(self):
     ridx0 = Range(0, 2)
@@ -83,6 +92,13 @@ class TestValidIdxSimplification(unittest.TestCase):
 
     for v in itertools.permutations([v0,v1,v2,v3]):
       self.assertEqual(simplify_valid(v[0]&v[1]&v[2]&v[3]).render(), "False")
+
+  def test_valid_stronger_bound_first(self):
+    # A weaker bound on the whole sum must not hide the tighter bound on r5 (CL IMAGE replay).
+    r3, r5 = Range(3, 2), Range(5, 8)
+    for clauses in itertools.permutations([r5<7, r3*7+r5<8, r3*7+r5<7]):
+      valid = graph_rewrite(UOp.uprod(*clauses), sym)
+      self.assertEqual(set(valid.split_uop(Ops.AND)), {r5<7, r3<1})
 
   def test_simplify_valid_from_div(self):
     x = Variable("x", -100, 100)
@@ -239,6 +255,8 @@ class TestImageSimplification(unittest.TestCase):
 
     # same thing, valid has a div
     load = get_load_image_uop((10, 10, 4), gidx1//2<5, (gidx0, gidx1))
+    self.check(load, None, "gidx0", "gidx1")
+    load = get_load_image_uop((10, 10, 4), gidx1<=9, (gidx0, gidx1))
     self.check(load, None, "gidx0", "gidx1")
 
     # 10x20 image, not out of bound
@@ -502,6 +520,19 @@ class TestImageSimplification(unittest.TestCase):
                               (Special("gidx0", 10), idx_y))
     off = graph_rewrite(load.sink(), pm_commit_weak+indexing_simplify).src[0].src[0]
     self.assertEqual(off.src[1].get_valid(), UOp.const(True))
+
+  def test_int64_index_into_image_with_emulated_long(self):
+    with Context(DEV="NULL:OPENCL:,IMAGE_PITCH_ALIGNMENT=64", IMAGE=1, EMULATED_DTYPES="long"):
+      Tensor.empty(96, 128)[Tensor([3, 1, 5], dtype=dtypes.int64)].realize()
+
+class TestImageStore(unittest.TestCase):
+  def test_half_store_converts_lane_by_lane(self):
+    # a half4 stored to a half image converts to float per lane: a half4->float4 CAST is not valid OpenCL
+    img = UOp.param(0, dtypes.half, 256)
+    img = img.replace(arg=replace(img.arg, image=(8, 8)))
+    gidx0, gidx1 = Special("gidx0", 8), Special("gidx1", 8)
+    store = graph_rewrite(img.index(gidx1, gidx0).store(UOp.param(1, dtypes.half, (64, 4)).index(gidx1*8+gidx0)), pm_simplify_add_image)
+    self.assertEqual([(s.op, s.shape) for s in store.src[1].src], [(Ops.CAST, ())]*4)
 
 class TestDropTrueGate(unittest.TestCase):
   def test_drop_true_gate_on_index(self):

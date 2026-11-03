@@ -79,7 +79,7 @@ class TestWeakPromotion(unittest.TestCase):
     self.assertEqual((out.src[1], out.src[2]), (UOp.const(5.0, dtypes.bfloat16), gate))
 
   def test_weak_srcs_commit_only_at_a_concrete_lub(self):
-    weak_lub = UOp(Ops.ADD, src=(UOp.const(1), UOp.const(1.0)))
+    weak_lub = UOp(Ops.ADD, src=(UOp.const(2.0), UOp.const(1.0)))
     self.assertIs(graph_rewrite(weak_lub, pm_commit_weak), weak_lub)
     concrete = UOp.const(2.0).cast(dtypes.float16)
     # the weak arm stays bare: its sibling states the width, so the WHERE already derives float16 for it
@@ -155,14 +155,16 @@ class TestWeakPromotion(unittest.TestCase):
     for t in (Tensor.full((1,), 1, dtype=dtypes.int64, device="NULL") + 2**40,
               Tensor.full((1,), 1.0, dtype=dtypes.float64, device="NULL") + (1.0 + 2**-40)):
       t.realize()
-      self.assertNotIn(t.uop.buffer.dtype, dtypes.weaks)
+      self.assertNotIn(t.uop.dtype, dtypes.weaks)
+      self.assertEqual(t.uop.buffer.nbytes, t.numel() * t.dtype.itemsize)
 
   def test_computed_float_index_lowers(self):
     # a half-pixel nearest index resolves its float-scaled range before the gather
     idx = (Tensor.arange(8) + 0.5) / 4 - 0.5
     idx = (idx.clip(0, 1) - 0.5).ceil().int()
     out = Tensor([0, 1], device="NULL")[idx].contiguous().realize()
-    self.assertNotIn(out.uop.buffer.dtype, dtypes.weaks)
+    self.assertNotIn(out.uop.dtype, dtypes.weaks)
+    self.assertEqual(out.uop.buffer.nbytes, out.numel() * out.dtype.itemsize)
 
 class TestWeakStorageBoundary(unittest.TestCase):
   # weak has no storage: a weak assignment source casts when it defers to the destination, everything else raises

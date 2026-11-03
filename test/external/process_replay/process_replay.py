@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # compare kernels created by HEAD against master
 import os, multiprocessing, logging, pickle, sqlite3, difflib, warnings, functools, base64, codecs
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from typing import Callable, Any
 
@@ -37,6 +38,7 @@ SKIP_PROCESS_REPLAY = (k:="[skip_process_replay]") in os.getenv("COMMIT_MESSAGE"
 # uncomment this to disable by default
 #SKIP_PROCESS_REPLAY = not ASSERT_DIFF and not ((k:="[p]") in os.getenv("COMMIT_MESSAGE", "") or k in os.getenv("PR_TITLE", ""))
 if REF == "master": SKIP_PROCESS_REPLAY = True
+if REF == "update_benchmark": SKIP_PROCESS_REPLAY = "[pr]" not in os.getenv("COMMIT_MESSAGE", "").lower()
 class ProcessReplayWarning(Warning): pass
 
 # *** replay the function and convert return values to string
@@ -77,7 +79,8 @@ def diff(offset:int, fxns:dict[str, Callable[..., tuple|None]]) -> None:
       break
     name, loc = "", ""
     try:
-      name, args, kwargs, ctx_vals, loc, ret = pickle.loads(row[0])
+      name, args, kwargs, ctx_vals, ret = pickle.loads(row[0])
+      loc = ctx_vals["PROCESS_REPLAY_LOC"].value
       ctx_vars = {k:v.value for k,v in ctx_vals.items() if k not in ("DEBUG", "CAPTURE_PROCESS_REPLAY")
                   and (var:=ContextVar._cache.get(k)) is not None and var.value != v.value}
       if (replayer:=fxns.get(name)) is None: continue
@@ -107,12 +110,9 @@ def _pmap(fxns:dict[str, Callable]) -> None:
   finally:
     cur.close()
 
-  with multiprocessing.get_context("spawn").Pool(multiprocessing.cpu_count()) as pool:
-    bar = tqdm(total=row_count)
-    for _ in pool.imap_unordered(functools.partial(diff, fxns=fxns), range(0, row_count, s:=min(PAGE_SIZE, row_count))): bar.update(s)
-    pool.close()
-    pool.join()
-    pool.terminate()
+  with ProcessPoolExecutor(multiprocessing.cpu_count(), mp_context=multiprocessing.get_context("spawn")) as pool:
+    with tqdm(total=row_count) as bar:
+      for _ in pool.map(functools.partial(diff, fxns=fxns), range(0, row_count, s:=min(PAGE_SIZE, row_count))): bar.update(min(s, row_count-bar.n))
 
 # *** main loop
 

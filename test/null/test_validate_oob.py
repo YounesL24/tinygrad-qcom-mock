@@ -6,7 +6,7 @@ from tinygrad.uop.ops import Ops, UOp, AxisType
 from tinygrad.uop.validate import validate_index_with_z3
 from test.helpers import to_uops_list
 
-def Variable(name, nmin, nmax): return UOp.variable(name, nmin, nmax, param=True)
+def Variable(name, nmin, nmax): return UOp.variable(name, nmin, nmax)
 
 class TestValidateOOB(unittest.TestCase):
   """Test z3 validation of index bounds for different ALU ops and patterns."""
@@ -97,9 +97,40 @@ class TestValidateOOB(unittest.TestCase):
       to_uops_list([buf.index((r & -4).valid(r < 16)).load()])  # 0..12 valid
       with self.assertRaises(RuntimeError):
         to_uops_list([buf.index(r & -2).load()])  # 0..100 oob
-      # other masks can't be modeled as mod
-      with self.assertRaisesRegex(RuntimeError, "z3 int AND only supports"):
+      # any mask is modeled now, and r&21 can hit 16..21
+      with self.assertRaises(RuntimeError):
         to_uops_list([buf.index(r & 21).load()])
+
+  def test_or(self):
+    with Context(CHECK_OOB=1, SPEC=2):
+      buf = UOp.param(0, dtypes.int, 512)
+      r = UOp.range(256, 0, AxisType.GLOBAL)
+      # disjoint bits: a byte | high bits << 8
+      to_uops_list([buf.index((r & 255) | ((r & 1) << 8)).load()])  # 0..511 valid
+      with self.assertRaises(RuntimeError):
+        to_uops_list([buf.index((r & 255) | ((r & 3) << 8)).load()])  # 0..1023 oob
+      # overlapping bits
+      to_uops_list([buf.index(r | (r << 1)).load()])  # 0..511 valid
+      with self.assertRaises(RuntimeError):
+        to_uops_list([buf.index(r | (r << 3)).load()])  # 0..2047 oob
+
+  def test_or_negative(self):
+    with Context(CHECK_OOB=1, SPEC=2):
+      buf = UOp.param(0, dtypes.int, 16)
+      v, u = Variable("v", -16, -1), Variable("u", 0, 15)
+      # or with a negative side is negative, the mask is never true
+      w = v | u
+      to_uops_list([buf.index(w.valid(w >= 0)).load()])
+      with self.assertRaises(RuntimeError):
+        to_uops_list([buf.index(w).load()])
+
+  def test_or_in_mask(self):
+    with Context(CHECK_OOB=1, SPEC=2):
+      buf = UOp.param(0, dtypes.int, 32)
+      r = UOp.range(64, 0, AxisType.GLOBAL)
+      to_uops_list([buf.index(r.valid((r < 8) | ((r >= 16) & (r < 32)))).load()])  # 0..7,16..31 valid
+      with self.assertRaises(RuntimeError):
+        to_uops_list([buf.index(r.valid((r < 8) | (r >= 56))).load()])  # 8..55 unmasked
 
   def test_max(self):
     with Context(CHECK_OOB=1, SPEC=2):
@@ -124,7 +155,7 @@ class TestValidateOOB(unittest.TestCase):
       i = (r.cast(dtypes.float) * 0.68).trunc().cast(dtypes.int)
       to_uops_list([buf.index(i.valid((i >= 0) & (i < 16))).load()])
       # a float entirely out of the int range has no value, not an empty one
-      f = UOp.variable("f", 3e9, 4e9, dtypes.float32, param=True).cast(dtypes.int)
+      f = UOp.variable("f", 3e9, 4e9, dtypes.float32).cast(dtypes.int)
       with self.assertRaises(RuntimeError):
         to_uops_list([buf.index(f).load()])
 
@@ -240,7 +271,7 @@ class TestShiftBounds(unittest.TestCase):
         self._check_max_index((UOp.const(-9, dtype) >> n) + 9, 7)
 
   def test_lowered_shift_count(self):
-    n = UOp.variable("n", 0, 63, dtypes.uint32, param=True)
+    n = UOp.variable("n", 0, 63, dtypes.uint32)
     self._check_max_index(UOp.const(65535, dtypes.uint64).alu(Ops.SHR, n), 65535)
 
   def test_weak_shifts_beyond_64_bits(self):

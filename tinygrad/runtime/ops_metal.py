@@ -1,15 +1,15 @@
 from __future__ import annotations
 import subprocess, pathlib, struct, ctypes, tempfile, functools, platform, weakref, threading, array, sys
-from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup
+from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup, to_tuple
 import tinygrad.runtime.support.objc as objc
 from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, Compiler, CompileError, MMIOInterface
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.cstyle import MetalRenderer
 from tinygrad.runtime.autogen import metal
 from tinygrad.runtime.support.c import DLL
-from tinygrad.runtime.support.hcq2 import HWQueue, EncodeCtx, encode_submit, ccall, patch, layout_args
-from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher
-from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
+from tinygrad.runtime.support.hcq2 import HWQueue, ccall, patch, layout_args, to_name
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
+from tinygrad.engine.realize import get_call_kernel_args
 
 # 13 is requestType that metal uses to compile source code into MTLB, there aren't any docs or symbols.
 REQUEST_TYPE_COMPILE = 13
@@ -83,32 +83,56 @@ class MetalCompiler(Compiler):
 # queue
 
 HANDLES = ("queue", "event", "fence", "resources", "count")
-SELECTORS = ("commandBuffer", "computeCommandEncoder", "waitForFence:", "updateFence:", "encodeSignalEvent:value:", "endEncoding", "commit",
-             "useResources:count:usage:", "executeCommandsInBuffer:withRange:", "concurrentDispatchThreadgroups:threadsPerThreadgroup:",
-             "setComputePipelineState:", "dispatchThreadgroups:threadsPerThreadgroup:", "signaledValue")
-MSGSEND = {ret: metal.dll.bind(ret)(metal.dll.objc_msgSend) for ret in (None, ctypes.c_void_p)} # objc_msgSend by return type
+MSGSEND, SELNAME = [metal.dll.bind(ctypes.c_void_p)(f) for f in (metal.dll.objc_msgSend, metal.dll.sel_registerName)]
 
-def mtl_sel(dev, name:str) -> UOp:
-  return UOp.placeholder((len(HANDLES) + len(SELECTORS),), dtypes.uint64, 0, device=dev, tag="mtl_sel").index((HANDLES + SELECTORS).index(name))
-def mtl_cb(dev) -> UOp: return UOp.placeholder((1,), dtypes.uint64, 0, device=dev, volatile=True, tag="mtl_cb").index(0) # the command buffer
-def mtl_enc(dev) -> UOp: return UOp.placeholder((1,), dtypes.uint64, 0, device=dev, volatile=True, tag="mtl_enc").index(0) # its encoder
+# the slot of a handle of the device
+def mtl_handle(d, name:str) -> UOp:
+  return UOp.alloc((len(HANDLES),), dtypes.uint64, 0, device=to_tuple(d)[0], name="handles")[(i:=HANDLES.index(name)):i+1]
 
-def mtl_msg(h:UOp, target:UOp, sel:str, *args:UOp|int, ret=None) -> UOp: # objc_msgSend, after h
-  obj = target.src[0].after(h).index(target.src[1]).load()
-  return ccall(MSGSEND[ret], obj, mtl_sel(obj.device, sel).load(), *[UOp.const(a, dtypes.uint64) if isinstance(a, int) else a for a in args])
+@uopfunc
+def mtl_send(obj:UOp, sel:UOp, a:UOp, b:UOp, c:UOp, out:UOp|None=None) -> UOp: # objc_msgSend by the selector's name, the result to out
+  c = ccall(MSGSEND, obj, ccall(SELNAME, sel), a, b, c)
+  return (out.index(0).store(c) if out is not None else c).sink()
 
-# the timeline is the event
-def mtl_poll(tl:UOp) -> UOp: return mtl_msg(tl, mtl_sel(tl.device, "event"), "signaledValue", ret=ctypes.c_void_p)
+def mtl_msg(obj:UOp, sel:str, *args:UOp|int, out:UOp|None=None) -> UOp:
+  words = [UOp.const(a, dtypes.uint64) if isinstance(a, int) else a for a in (*args, 0, 0, 0)][:3] # the extra args are ignored
+  return mtl_send(obj.index(0).load(), UOp(Ops.BINARY, arg=sel.encode() + b"\0").index(0), *words, out=out)
+
+@uopfunc
+def mtl_run(icb:UOp, value:UOp, first:UOp|int, count:int, last:bool, q:MetalQueue, stamp:UOp|None=None) -> UOp:
+  cmds, hdr, devs, dev = q.cmds, round_up(q.nbytes, 8) + 24, q.devs, q.dev # a command buffer for the commands [first, first + count)
+  cb, enc = [UOp.alloc((1,), dtypes.uint64, 0, device=devs[0], name=t) for t in ("mtl_cb", "mtl_enc")]
+  fence, event = [mtl_handle(devs, h).index(0).load() for h in ("fence", "event")]
+  c = mtl_msg(mtl_handle(devs, "queue"), "commandBuffer", out=cb)
+  c = mtl_msg(cb.after(c), "computeCommandEncoder", out=enc)
+  c = mtl_msg(enc.after(c), "waitForFence:", fence)
+  if dev.residency.value is None: # no residency set: declare the buffers
+    c = mtl_msg(enc.after(c), "useResources:count:usage:", *[mtl_handle(devs, h).index(0).load() for h in ("resources", "count")], 3)
+
+  # before apple9 the encoder must use the pipelines
+  if not dev.arch.startswith("Apple") or int(dev.arch[5:]) < 9:
+    r = UOp.range(len(dedup(c.src[:2] for c in cmds)), next(UOp.unique_num), dtype=dtypes.uint64)
+    c = mtl_msg(enc.after(c), "setComputePipelineState:", icb.bitcast(dtypes.uint64).index(hdr // 8 + 1 + len(cmds) + r).load())
+    c = mtl_msg(enc.after(c), "dispatchThreadgroups:threadsPerThreadgroup:", icb.index(hdr - 24), icb.index(hdr - 24)).end(r)
+
+  c = mtl_msg(enc.after(c), "executeCommandsInBuffer:withRange:", icb.bitcast(dtypes.uint64).index(hdr // 8).load(), first, count)
+  c = mtl_msg(enc.after(c), "updateFence:", fence)
+  c = mtl_msg(enc.after(c), "endEncoding")
+
+  if stamp is not None: # write meta to collect timestamps: [command buffer, 0] until synchronize reads its times. MTL4 solves that dance
+    c = stamp.after(c).index(3).store(0)
+    c = stamp.after(c).index(1).store(cb.after(c).index(0).load())
+  if last: c = mtl_msg(cb.after(c), "encodeSignalEvent:value:", event, value)
+  return mtl_msg(cb.after(c), "commit").sink()
 
 class MetalQueue(HWQueue):
   dev:MetalDevice
-  def __init__(self, ctx:EncodeCtx, submit:UOp):
-    super().__init__(ctx, submit)
-    self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[tuple](), list[tuple[int, int]](), list[UOp](), 0
+  def __init__(self, submit:UOp):
+    super().__init__(submit)
+    self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[UOp](), list[tuple[int, int]](), list[UOp](), 0
 
   def exec(self, call:UOp, prg:UOp):
-    bufs, vals, obj = get_call_arg_uops(call), get_call_var_uops(call, prg), prg.to_elf()
-    args = [bufs[i].getaddr(self.devs) for i in prg.arg.globals] + [v.ccast(var.dtype) for v, var in zip(vals, prg.arg.vars)]
+    args, obj = get_call_kernel_args(call, prg, self.devs), prg.to_elf()
     self.rows += (rows:=layout_args(args, off:=round_up(self.nbytes, 256)))
     self.nbytes = max([o + w.dtype.itemsize for o, w in rows], default=off + 8)
 
@@ -116,56 +140,30 @@ class MetalQueue(HWQueue):
     dims = (*prg.arg.global_size, *prg.arg.local_size)
     if any(isinstance(d, UOp) for d in dims):
       self.sizes.append((len(self.cmds), at:=round_up(self.nbytes, 8)))
-      self.rows += layout_args([d.cast(dtypes.uint64) if isinstance(d, UOp) else UOp.const(d, dtypes.uint64) for d in dims], at)
+      self.rows += layout_args([UOp.const(d, dtypes.uint64) for d in dims], at)
       self.nbytes = at + 48
-    self.cmds.append((obj.lib, obj.name, tuple(1 if isinstance(d, UOp) else int(d) for d in dims), off))
+    consts = [UOp.const(1 if isinstance(d, UOp) else d, dtypes.uint64) for d in (*dims, off)]
+    self.cmds.append(UOp(Ops.LINEAR, src=(UOp(Ops.BINARY, arg=obj.lib), UOp(Ops.BINARY, arg=obj.name.encode()), *consts))) # [lib, name, dims, off]
 
   def wait(self, dst:UOp, val:UOp, eq=False): pass # the fence orders the queue
   def timestamp(self, dst:UOp): self.stamps.append(dst)
   def signal(self, dst:UOp, val:UOp): self.value = val
 
   def submit(self, cmdbuf:UOp) -> UOp:
-    n, zero, pipes = len(self.cmds), round_up(self.nbytes, 8), dedup(c[:2] for c in self.cmds)
-    buf = UOp.placeholder((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=self.devs, volatile=True,
-                          tag=("mtl_icb", tuple(self.cmds), zero + 24))
-    args = patch(buf, self.rows + [(zero + 8 * i, UOp.const(0, dtypes.uint64)) for i in range(3)])
-    header, cb, enc, h = args.bitcast(dtypes.uint64)[zero // 8 + 3:], mtl_cb(self.devs), mtl_enc(self.devs), args
+    n, zero, pipes, cmds = len(self.cmds), round_up(self.nbytes, 8), dedup(c.src[:2] for c in self.cmds), UOp(Ops.LINEAR, src=tuple(self.cmds))
+    buf = UOp.alloc((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=self.devs[0], name="icb")
+    icb = patch(buf.after(buf.store(cmds), *self.deps), self.rows + [(zero + 8 * i, UOp.const(0, dtypes.uint64)) for i in range(3)])
 
     # symbolic sizes
     for ci, off in self.sizes:
-      h = mtl_msg(h, header.index(1 + ci), "concurrentDispatchThreadgroups:threadsPerThreadgroup:", args.index(off), args.index(off + 24))
-
-    def run(h:UOp, first:UOp|int, count:int, last:bool) -> UOp: # a command buffer for the commands [first, first + count)
-      h = cb.store(cbuf:=mtl_msg(h, mtl_sel(self.devs, "queue"), "commandBuffer", ret=ctypes.c_void_p))
-      h = enc.store(mtl_msg(h, cb, "computeCommandEncoder", ret=ctypes.c_void_p))
-      h = mtl_msg(h, enc, "waitForFence:", mtl_sel(self.devs, "fence").load())
-      if self.dev.residency.value is None: # no residency set: declare the buffers
-        h = mtl_msg(h, enc, "useResources:count:usage:", mtl_sel(self.devs, "resources").load(), mtl_sel(self.devs, "count").load(), 3)
-
-      # before apple9 the encoder must use the pipelines
-      if not self.dev.arch.startswith("Apple") or int(self.dev.arch[5:]) < 9:
-        r = UOp.range(len(pipes), next(UOp.unique_num), dtype=dtypes.uint64)
-        h = mtl_msg(h, enc, "setComputePipelineState:", header.index(1 + n + r).load())
-        h = mtl_msg(h, enc, "dispatchThreadgroups:threadsPerThreadgroup:", args.index(zero), args.index(zero)).end(r)
-
-      h = mtl_msg(h, enc, "executeCommandsInBuffer:withRange:", header.after(h).index(0).load(), first, count)
-      h = mtl_msg(h, enc, "updateFence:", mtl_sel(self.devs, "fence").load())
-      h = mtl_msg(h, enc, "endEncoding")
-
-      # write meta to collect timestamps: [command buffer, 0] until synchronize reads its times
-      # MTL4 solves that dance
-      if self.stamps:
-        slots = self.stamps[0].src[0] # [signal, timeline, [x, start, x, end]...]
-        h = slots.after(h).index(7 + 4 * first).store(0)
-        h = slots.after(h).index(5 + 4 * first).store(cbuf)
-
-      if last: h = mtl_msg(h, cb, "encodeSignalEvent:value:", mtl_sel(self.devs, "event").load(), self.value)
-      return mtl_msg(h, cb, "commit")
+      cmd = icb.bitcast(dtypes.uint64)[zero // 8 + 4 + ci:zero // 8 + 5 + ci]
+      icb = icb.after(mtl_msg(cmd, "concurrentDispatchThreadgroups:threadsPerThreadgroup:", icb.index(off), icb.index(off + 24)))
 
     # collect timestamps using cmdbuf metrics, so sep cmdbufs
-    if not self.stamps: return run(h, 0, n, True)
-    if n > 1: h = run(h.after(r:=UOp.range(n - 1, next(UOp.unique_num), dtype=dtypes.uint64)), r, 1, False).end(r)
-    return run(h, n - 1, 1, True)
+    if not self.stamps: return mtl_run(icb, self.value, 0, n, True, self)
+    slots, r = self.stamps[0].src[0], UOp.range(n - 1, next(UOp.unique_num), dtype=dtypes.uint64) # slots: [signal, timeline, [x, cb, x, end]...]
+    if n > 1: icb = icb.after(mtl_run(icb.after(r), self.value, r, 1, False, self, slots.shrink(((4 + 4 * r, 8 + 4 * r),))).end(r))
+    return mtl_run(icb, self.value, n - 1, 1, True, self, slots.shrink(((4 * n, 4 * n + 4),)))
 
 # *****************
 # device
@@ -184,14 +182,20 @@ class MetalAllocator(Allocator['MetalDevice']):
     storage.meta.release()
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
+Compiled.pm_encode += PatternMatcher([
+  (UPat.sink(arg=KernelInfo("metal_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"), lambda s: MetalQueue(s).encode()),
+])
+
+def poll_event(p:UOp, t:UOp) -> UOp|None:
+  if p.arg.name != "tl" or not str(p.device).startswith("METAL"): return None
+  event = mtl_handle(p.device, "event").after(t)
+  done = (r:=UOp.placeholder((1,), dtypes.uint64, None, AddrSpace.REG)).after(mtl_msg(event, "signaledValue", out=r))[0]
+  # then mirror it into the timeline
+  return r.after(t.index(0).store(done))[0]
+Compiled.pm_lower += PatternMatcher([(UPat(Ops.PARAM, name="p").f(Ops.AFTER, allow_any_len=True, name="t").index(UPat.const(0)).load(), poll_event)])
+
 class MetalDevice(Compiled):
   has_copy_queue = False
-  pm_encode = PatternMatcher([
-    (UPat(Ops.CUSTOM_FUNCTION, arg="submit_metal_compute", name="submit"), lambda ctx, submit: encode_submit(MetalQueue(ctx, submit))),
-  ])
-  pm_lower = PatternMatcher([
-    (UPat.var("tl").index(UPat(Ops.CONST, arg=0)).load(), lambda tl: mtl_poll(tl) if tl.without_after.tag == "timeline" else None),
-  ])
 
   def __init__(self, device:str=""):
     self.sysdevice = metal.MTLCreateSystemDefaultDevice()
@@ -207,23 +211,20 @@ class MetalDevice(Compiled):
 
     self.resources, self.table = list[int](), (ctypes.c_uint64 * 1)()
     self.event, self.fence = self.sysdevice.newSharedEvent(), self.sysdevice.newFence()
-    self.icbs, self.profile_slots = weakref.WeakKeyDictionary[Buffer, tuple](), weakref.WeakSet[Buffer]()
+    self.icbs = weakref.WeakKeyDictionary[Buffer, tuple]()
 
     # https://developer.apple.com/documentation/metal/mtlgpufamily
     def check_family(f): return next(filter(self.sysdevice.supportsFamily, reversed([v for v, nm in metal.enum_MTLGPUFamily.items() if f in nm])), 0)
     super().__init__(device, MetalAllocator(self), [MetalRenderer], None,
                      arch=metal.enum_MTLGPUFamily[check_family("Apple") or check_family("Mac")][12:])
-    self.pm_bufferize = PatternMatcher([
-      (UPat(Ops.PARAM, tag="mtl_sel"), lambda ctx: ctx.sels),
-      (UPat(Ops.PARAM, tag="slots", name="b"), lambda ctx, b: ctx.new_slots(b.max_numel()) if b.max_numel() > 4 else None), # with stamps
-      (UPat(Ops.PARAM, name="b"), lambda ctx, b: ctx.new_icb(*b.tag[1:]) if isinstance(b.tag, tuple) and b.tag[0] == "mtl_icb" else None),
-    ]) + self.pm_bufferize
+    Compiled.link_bufs |= {to_name(self.device, "handles"): lambda b: self.handles}
+    Compiled.pm_link += PatternMatcher([
+      (UPat(Ops.BUFFER, name="b").store(UPat(Ops.LINEAR, name="cmds")), lambda b, cmds, d=self: d.new_icb(b.buffer, cmds.src))])
 
   @functools.cached_property
-  def sels(self) -> Buffer: # handles, then selectors
-    vals = [self.queue.value, self.event.value, self.fence.value, ctypes.addressof(self.table), len(self.resources),
-            *[objc.getsel(s.encode()).value for s in SELECTORS]]
-    return Buffer(self.host, len(vals), dtypes.uint64, initial_value=struct.pack(f"{len(vals)}Q", *vals))
+  def handles(self) -> Buffer:
+    vals = [self.queue.value, self.event.value, self.fence.value, ctypes.addressof(self.table), len(self.resources)]
+    return Buffer(self.host, len(vals) * 8, initial_value=struct.pack(f"{len(vals)}Q", *vals))
 
   def mark_resident(self, mtl:metal.MTLBuffer, add:bool):
     if self.residency.value is not None:
@@ -234,11 +235,7 @@ class MetalDevice(Compiled):
     self.table = (ctypes.c_uint64 * max(len(self.resources), 1))(*self.resources)
 
     # update sels table
-    if "sels" in self.__dict__: self.sels.host.view(fmt='Q')[3:5] = array.array('Q', [ctypes.addressof(self.table), len(self.resources)])
-
-  def new_slots(self, n:int) -> Buffer:
-    self.profile_slots.add(buf:=Buffer(self.host, n, dtypes.uint64, initial_value=bytes(8 * n)))
-    return buf
+    if "handles" in self.__dict__: self.handles.host.view(fmt='Q')[3:5] = array.array('Q', [ctypes.addressof(self.table), len(self.resources)])
 
   @functools.cache
   def pipeline(self, lib:bytes, name:str) -> metal.MTLComputePipelineState:
@@ -248,24 +245,24 @@ class MetalDevice(Compiled):
     descriptor.setSupportIndirectCommandBuffers(True)
     return checked(self.sysdevice.newComputePipelineStateWithDescriptor_options_reflection_error, descriptor, metal.MTLPipelineOptionNone, None)
 
-  def new_icb(self, cmds:tuple[tuple[bytes, str, tuple[int, ...], int], ...], header:int) -> Buffer:
-    pipes = dedup(c[:2] for c in cmds)
-    buf = Buffer(self.device, header + 8 * (1 + len(cmds) + len(pipes)), dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+  def new_icb(self, buf:Buffer, cmds:tuple[UOp, ...]) -> UOp|None: # the icb handles are the tail of the buffer: [icb, commands, pipelines]
+    if buf.device != self.device: return None
+    pipes = [self.pipeline(lib.arg, name.arg.decode()) for lib, name in dedup(c.src[:2] for c in cmds)]
     desc = metal.MTLIndirectCommandBufferDescriptor.new()
     desc.setCommandTypes(metal.MTLIndirectCommandTypeConcurrentDispatch)
     desc.setMaxKernelBufferBindCount(1)
     icb = self.sysdevice.newIndirectCommandBufferWithDescriptor_maxCommandCount_options(desc, max(len(cmds), 1), 0)
     if icb.value is None: raise RuntimeError("create indirect command buffer failed, does your system support this?")
     commands = [icb.indirectComputeCommandAtIndex(i).own() for i in range(len(cmds))]
-    for cmd, (lib, name, dims, off) in zip(commands, cmds):
+    for cmd, (lib, name, *dims, off) in zip(commands, [(c.src[0].arg, c.src[1].arg.decode(), *[v.val for v in c.src[2:]]) for c in cmds]):
       cmd.setComputePipelineState(state:=self.pipeline(lib, name))
       if prod(dims[3:]) > (mx:=state.maxTotalThreadsPerThreadgroup()): raise RuntimeError(f"local size {dims[3:]} bigger than {mx}")
-      cmd.setKernelBuffer_offset_atIndex(buf.get_storage().meta, off, 0)
+      cmd.setKernelBuffer_offset_atIndex(buf.meta, buf.offset + off, 0)
       cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(metal.MTLSize(*dims[:3]), metal.MTLSize(*dims[3:]))
       cmd.setBarrier()
-    buf.host.view(fmt='Q')[header // 8:] = array.array('Q', [icb.value, *[c.value for c in commands], *[self.pipeline(*p).value for p in pipes]])
+    buf.host.view(fmt='Q')[-1 - len(cmds) - len(pipes):] = array.array('Q', [icb.value, *[c.value for c in commands], *[p.value for p in pipes]])
     self.icbs[buf] = (icb, commands)
-    return buf
+    return UOp(Ops.NOOP)
 
   def _wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
     if sys.is_finalizing(): return # the event doesn't wake at exit
@@ -273,12 +270,10 @@ class MetalDevice(Compiled):
     if not wait(self.event, value, int(self.wait_timeout_ms)): raise RuntimeError(f"{self.device} signal wait timed out")
 
   def synchronize(self, timeout:int|None=None):
-    for buf in list(self.profile_slots): # pending: [command buffer, 0]
-      slots = buf.host.view(fmt='Q')
-      for start in range(5, buf.size, 4):
-        if slots[start] and not slots[start + 2]:
-          (cb:=metal.MTLCommandBuffer(slots[start])).waitUntilCompleted()
-          slots[start], slots[start + 2] = int(cb.GPUStartTime() * 1e9), int(cb.GPUEndTime() * 1e9)
+    for slots, start in [(buf.host.view(fmt='Q'), start) for buf, start in self.prof_ents]:
+      if slots[start] and not slots[start + 2]: # [command buffer, 0]
+        (cb:=metal.MTLCommandBuffer(slots[start])).waitUntilCompleted()
+        slots[start], slots[start + 2] = int(cb.GPUStartTime() * 1e9), int(cb.GPUEndTime() * 1e9)
 
     super().synchronize(timeout)
     if (pool:=getattr(pools, "pool", None)) is not None: objc.lib.objc_autoreleasePoolPop(pool)

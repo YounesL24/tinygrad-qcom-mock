@@ -2,8 +2,9 @@ import collections, time
 from typing import Any, cast
 from tinygrad.helpers import round_up, PROFILE, ALL2ALL, merge_dicts, getenv, suppress_finalizing, TracingKey, unwrap
 from extra.hcq1.hcq import HCQBuffer, HCQCompiled, HCQAllocator, HCQSignal, HWQueue, HCQArgsState
+from tinygrad.runtime.support.hcq2 import DepsTracker
 from tinygrad.runtime.support.memory import BumpAllocator, MMIOInterface
-from tinygrad.device import BufferStorage, Buffer, BufferSpec, Compiled, Device, MultiBuffer, ProfileGraphEntry, ProfileGraphEvent, DepsTracker
+from tinygrad.device import BufferStorage, Buffer, BufferSpec, Compiled, Device, MultiBuffer, ProfileGraphEntry, ProfileGraphEvent
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, Ops, Variable
 from tinygrad.engine.realize import estimate_uop, get_runtime, unwrap_multi, resolve_params, get_call_arg_uops
@@ -70,7 +71,7 @@ class GraphRunner:
 class HCQGraph(GraphRunner):
   def _access_resources(self, bufs:list[Buffer], write:list[int], new_dependency:Any):
     if not hasattr(self, "deps"): self.deps = DepsTracker()
-    return self.deps.access_resources(bufs, write, new_dependency)
+    return self.deps.access_resources([UOp.from_buffer(b.base, dtypes.uint8)[b.offset:b.offset + b.nbytes] for b in bufs], write, new_dependency)
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -134,7 +135,6 @@ class HCQGraph(GraphRunner):
     # When profiling allocate 2 signals for each jit item to measure speed. The jth jit item have signals at 2*j and 2*j+1.
     # TODO: This logic might allocate a few extra signals...
     self.prof_signals: list[HCQSignal] = []
-    self.prof_graph_deps: list[list[int]] = []
     self.prof_graph_entries: list[ProfileGraphEntry] = []
 
     self.last_j: dict[HWQueue, int|None] = collections.defaultdict(lambda: None)
@@ -204,7 +204,6 @@ class HCQGraph(GraphRunner):
         prof_name = enqueue_dev.device if runtime is not None else f"{enqueue_dev.device}:SDMA:{queue_idx}"
         self.prof_graph_entries.append(ProfileGraphEntry(prof_name, prof_ji_desc, sig_st, j * 2 + 1,
                                                          runtime.profile_key if runtime is not None else None))
-        self.prof_graph_deps.append([d - 1 for _, d in rdeps])
 
       self.last_j[enqueue_queue] = j
 
@@ -367,7 +366,7 @@ class HCQGraph(GraphRunner):
 
   def collect_timestamps(self):
     # NOTE: Append to any device is fine...
-    self.devices[0].profile_events += [ProfileGraphEvent(self.prof_graph_entries, self.prof_graph_deps, [s.timestamp for s in self.prof_signals])]
+    self.devices[0].profile_events += [ProfileGraphEvent(self.prof_graph_entries, [s.timestamp for s in self.prof_signals])]
 
   def dev_name(self, dev) -> str: return dev.device.replace(":", "_")
 

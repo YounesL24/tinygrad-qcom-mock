@@ -1,10 +1,10 @@
 from __future__ import annotations
 import functools, itertools, math, string
-from typing import TYPE_CHECKING, Callable, Self, Sequence, Literal, get_args
+from typing import TYPE_CHECKING, Any, Callable, Self, Sequence, Literal, get_args
 from tinygrad.mixin.elementwise import ElementwiseMixin
 from tinygrad.mixin.movement import MovementMixin
 from tinygrad.mixin.reduce import ReduceMixin
-from tinygrad.uop import Ops
+from tinygrad.uop import Ops, GroupOp
 from tinygrad.uop.ops import _broadcast_shape, resolve, smax, smin, identity_element
 from tinygrad.dtype import ConstType, DType, DTypeLike, Invalid, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype, commit_int
 from tinygrad.helpers import all_int, argfix, ceildiv, flatten, flat_to_grouped, fully_flatten, get_shape, make_tuple, merge_dicts, prod
@@ -29,7 +29,30 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     ```
     """
     assert self.numel() == 1, "must have one element for item"
-    return self.data()[(0,) * len(self.shape)]
+    return self.reshape(()).tolist()  # type: ignore[return-value]
+
+  # NOTE: list[Any] because return type is recursive (list[list[...]] for higher dimensions)
+  def tolist(self) -> PyConst|list[Any]:
+    """
+    Returns the value of this tensor as a nested list.
+    Returns single value for const tensor.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([1, 2, 3, 4])
+    print(t.tolist())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor(5)
+    print(t.tolist())
+    ```
+    """
+    # TODO: remove half once minimum python supports it
+    if self.dtype in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s): return self.cast(dtypes.float32).tolist()
+    if 0 in self.shape:
+      assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
+      def _tolist(shape:tuple[int, ...]): return [_tolist(shape[1:]) for _ in range(shape[0])]
+      return _tolist(self.shape)
+    return self.data().tolist()
 
   def __getitem__(self, indices) -> Self:
     """
@@ -135,7 +158,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
       x = (mask.where(x.reshape(reshape_arg), 0)).sum(sum_axis:=tuple(d + len(big_shape) for d in dims), dtype=x.dtype)
 
       # special permute case
-      if (permuted := dims[0] != 0 and len(dims) != 1 and tuple(dims) != tuple(range(dims[0], dims[-1]+1))):
+      if (permuted := dims[0] != 0 and not consecutive):
         mask, x = (y.permute(*range(dims[0], dims[0]+len(big_shape)), *range(0, dims[0]), *range(dims[0]+len(big_shape), y.ndim)) for y in (mask, x))
 
       if v is None: return x  # advanced getitem
@@ -151,7 +174,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     per_dim = []
     for d, m in enumerate(mops):
       (s, e), st = m['boundary'], abs(m['stride'])
-      if st != 1 and vb.shape[d] > 1:  # un-stride: interleave with zeros
+      if st != 1:  # un-stride: interleave with zeros
         vb = vb.unsqueeze(d+1)
         vb = vb.pad_to(tuple(st if j == d+1 else None for j in range(vb.ndim)))
         vb = vb.reshape(vb.shape[:d] + (vb.shape[d]*vb.shape[d+1],) + vb.shape[d+2:])
@@ -389,7 +412,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if x.shape[-1] != w.shape[axis_w:=-min(w.ndim,2)]: raise RuntimeError(f"cannot dot {x.shape} and {w.shape}")
     x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
     w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:]).transpose(-1, axis_w)
-    return (x*w).sum(-1, dtype=dtype).cast(least_upper_dtype(x.dtype, w.dtype) if dtype is None else to_dtype(dtype))
+    return (x*w).sum(-1, dtype=dtype).cast(least_upper_dtype(x.dtype, w.dtype) if dtype is None else dtype)
 
   def matmul(self, x:Self, reverse=False, dtype:DTypeLike|None=None) -> Self:
     """
@@ -656,7 +679,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
 
   def _softmax(self, axis, dtype:DTypeLike|None=None) -> tuple[Self, Self, Self]:
     m = self - self.max(axis=axis, keepdim=True).detach()
-    if dtype is not None: m = m.cast(to_dtype(dtype))
+    if dtype is not None: m = m.cast(dtype)
     e = m.exp()
     return m, e, e.sum(axis=axis, keepdim=True)
 
@@ -750,7 +773,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     return padded[0].usum(*padded[1:])
 
   def _cumalu(self, axis:int, op:Ops) -> Self:
-    assert self.shape[axis] != 0 and op in (Ops.ADD, Ops.MAX, Ops.MUL)
+    assert self.shape[axis] != 0 and op in GroupOp.Reduce
     pads = (None,)*(self.ndim-1) + ((self.shape[axis]-1, 0),)
     pooled = self.transpose(axis,-1)._pad_constant(pads, identity_element(op, self.commit_dtype()))._pool((self.shape[axis],))
     return getattr(pooled, {Ops.ADD: "sum", Ops.MAX: "max", Ops.MUL: "prod"}[op])(-1).transpose(axis, -1)
@@ -810,7 +833,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     values, n = self._split_cumalu(axis, Ops.MAX), int(self.shape[axis])
     x, values_t = self.transpose(axis, -1), values.transpose(axis, -1)
     match = x.unsqueeze(-1).eq(values_t.unsqueeze(-2)) * self._tri(n, n)
-    idx = (-(match * type(self).arange(n, 0, -1).reshape(n, 1)).max(-2) + n).cast(dtypes.int32)
+    idx = (match * type(self).arange(n).reshape(n, 1)).max(-2).cast(dtypes.int32)
     return values, idx.transpose(-1, axis)
 
   def cummin(self, axis:int=0) -> tuple[Self, Self]:
@@ -1172,7 +1195,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     for dim in reversed(axes):
       mask, values = functools.reduce(lambda x,y: (x[0]|y[0], y[0].where(y[1], x[1])), zip(mask.split(1, dim), values.split(1, dim)))
     # remove extra dims from reduce
-    for dim in reversed(axes): mask, values = mask.squeeze(dim), values.squeeze(dim)
+    mask, values = mask.squeeze(axes), values.squeeze(axes)
     # select from values for each True element in mask else select from self
     return mask.where(values, self)
 
@@ -1264,9 +1287,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     print(t.linear(weight, bias).numpy())
     ```
     """
-    if dtype is not None:
-      dt = to_dtype(dtype)
-      return self.cast(dt).linear(weight.cast(dt), bias.cast(dt) if bias is not None else bias)
+    if dtype is not None: return self.cast(dtype).linear(weight.cast(dtype), bias.cast(dtype) if bias is not None else bias)
     x = self.mul(weight) if len(weight.shape) == 1 else self.dot(weight)
     return x.add(bias) if bias is not None else x
 
@@ -1643,6 +1664,23 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     padding = flatten((((k-1)*d-pB,(k-1)*d-pA+op) for k,d,(pB,pA),op in reversed(list(zip(HW, dilation, padding, output_padding)))))
     return x.conv2d(w.flatten(end_dim=1), groups=groups, bias=bias, dilation=dilation, padding=padding)
 
+  def rmsnorm(self, axis:int|tuple[int,...]=-1, eps:float=1e-6) -> Self:
+    """
+    Applies Root Mean Square Normalization over a mini-batch of inputs.
+
+    - Paper: https://arxiv.org/abs/1910.07467
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.randn(8, 10, 16) * 2 + 8
+    print(t.square().mean().sqrt().item())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = t.rmsnorm()
+    print(t.square().mean().sqrt().item())
+    ```
+    """
+    return self.mul(self.square().mean(axis, keepdim=True).add(eps).rsqrt())
+
   def layernorm(self, axis:int|tuple[int,...]=-1, eps:float=1e-5) -> Self:
     """
     Applies Layer Normalization over a mini-batch of inputs.
@@ -1658,8 +1696,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     print(t.mean().item(), t.std().item())
     ```
     """
-    y = (self - self.mean(axis, keepdim=True))
-    return y.mul((y*y).mean(axis, keepdim=True).add(eps).rsqrt())
+    return (self - self.mean(axis, keepdim=True)).rmsnorm(axis, eps)
 
   def batchnorm(self, weight:Self|None, bias:Self|None, mean:Self, invstd:Self, axis:int|tuple[int, ...]=1) -> Self:
     """
