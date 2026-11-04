@@ -1,5 +1,6 @@
 import ctypes
 import functools
+import mmap
 
 from test.mockgpu.driver import TextFileDesc, VirtDriver, VirtFile, VirtFileDesc
 
@@ -158,7 +159,8 @@ class QCOMDriver(VirtDriver):
             flags = struct.flags
             # ignore va_len, metadata, unused
             if not (flags & kgsl.KGSL_MEMFLAGS_USE_CPU_MAP): raise NotImplementedError("Only KGSL_MEMFLAGS_USE_CPU_MAP is supported")
-            data = bytearray(size) #map to cpu address, then map to gpu too
+            data = mmap.mmap(-1, size) #map to cpu address, then map to gpu too
+            # page aligned and zeroed like kgsl's allocations: texture / IBO descriptors drop the low 5 bits of the base address
             vaddr = ctypes.addressof(ctypes.c_char.from_buffer(data))
             self.gpu.map_range(vaddr, size)
             self.object_by_id[self.next_obj_id] = QCOMObject(vaddr, data, size)

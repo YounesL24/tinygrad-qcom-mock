@@ -2,17 +2,22 @@
 import ctypes
 from dataclasses import dataclass
 import functools
+import hashlib
 import itertools
 import math
+import os
+import pathlib
 import re
 import tempfile
-from typing import Any, Callable
+import time
+from typing import Any
 
 from tinygrad.runtime.autogen import mesa
 from tinygrad.codegen import to_program
 from tinygrad.device import Buffer, BufferSpec, Device
 from tinygrad.engine.realize import get_runtime
-from tinygrad.helpers import DEBUG, Context, colored
+from tinygrad.engine.worker import get_worker_pool
+from tinygrad.helpers import DEBUG, Context, colored, diskcache_get, diskcache_put
 from tinygrad.runtime.autogen import libc
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.dtype import dtypes
@@ -25,6 +30,7 @@ NUM_S_REG = 8 * 4
 NUM_C_REG = 512 * 4
 NUM_A_REG = 2 * 1
 NUM_P_REG = 1 * 4
+NUM_IMG_DESC = 32  # texture / IBO descriptors visible to a shader
 
 def _c(val, dtype=dtypes.uint32): return UOp.const(val, dtype)
 
@@ -53,6 +59,12 @@ def _as_float16(value: UOp) -> UOp:
     return value.cast(dtypes.uint16).bitcast(dtypes.float16).cast(dtypes.float32)
 
 
+def _qcom_demoted_const_f16(ctx, token: str) -> UOp:
+    """A half-precision float read of a constant: the 32-bit constant is converted f32 -> f16 (CONSTANT_DEMOTION_ENABLE)."""
+    _, reg, dim = _qcom_reg_token(token)
+    return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int)).bitcast(dtypes.float32).cast(dtypes.float16).cast(dtypes.float32)
+
+
 def _qcom_float_operand(ctx, field, lane: UOp) -> UOp:
     """Read an operand as a float before applying its typed abs/neg modifiers."""
     raw, mods = _qcom_read_raw_operand(ctx, field.value, lane, field.modifiers)
@@ -60,7 +72,8 @@ def _qcom_float_operand(ctx, field, lane: UOp) -> UOp:
         kind, _, _ = _qcom_reg_token(field.value)
     except ValueError:
         kind = ""
-    value = _as_float16(raw) if kind in {"hr", "hs", "hc"} else _as_float32(raw)
+    if kind == "hc": value = _qcom_demoted_const_f16(ctx, field.value)
+    else: value = _as_float16(raw) if kind in {"hr", "hs"} else _as_float32(raw)
     return _apply_qcom_operand_modifiers(value, mods)
 
 
@@ -83,27 +96,44 @@ def _thread_active(exec_mask: UOp, thread_id: UOp) -> UOp:
   return ((exec_mask >> thread_id.cast(dtypes.uint32)) & _c(1)).ne(_c(0))
 
 class _Ctx:
-    __slots__ = ("_axis_id", "wave_size", "r_reg", "p_reg", "merged")
-    # Half registers are packed into the low/high halves of the full-width register buffer.
-    s_reg = UOp.param(1, dtypes.uint32, NUM_S_REG, name="s_reg")
-    c_reg = UOp.param(2, dtypes.uint32, NUM_C_REG, name="c_reg")
-    a_reg = UOp.param(3, dtypes.uint32, NUM_A_REG, name="a_reg")
-    vmem = UOp.param(5, dtypes.uint8, 1<<48, name="vmem")  # host VAs reach 2**47
-    shared = UOp.param(6, dtypes.uint8, 32 * 1024, name="shared")
-    pvt_mem = UOp.param(7, dtypes.uint8, 1 << 30, name="pvt_mem")
-    _exec_mask = UOp.param(8, dtypes.uint64, 1, name="exec_mask")
-
-    _r_reg_cache: dict[int, UOp] = {}
+    __slots__ = ("_axis_id", "wave_size", "merged", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "vmem", "shared", "pvt_mem", "tmp", "tex", "ibo", "_exec_mask", "_bufs", "fused_lane")
+    # The kernel's buffers, in argument order. Half registers are packed into the low/high halves of the full-width register buffer.
+    r_reg: UOp
+    s_reg: UOp
+    c_reg: UOp
+    a_reg: UOp
+    p_reg: UOp
+    vmem: UOp
+    shared: UOp
+    pvt_mem: UOp
+    tmp: UOp
+    tex: UOp
+    ibo: UOp
+    _exec_mask: UOp
 
     def __init__(self, wave_size = 64, merged = False):
         self._axis_id = 0
         self.wave_size = wave_size
         self.merged = merged
-        if wave_size not in _Ctx._r_reg_cache: _Ctx._r_reg_cache[wave_size] = UOp.param(0, dtypes.uint32, R_WORDS * wave_size, name="r_reg")
-        self.r_reg = _Ctx._r_reg_cache[wave_size]
-        self.p_reg = UOp.param(4, dtypes.uint32, NUM_P_REG * wave_size, name="p_reg")
+        self._bufs = {
+            "r_reg": UOp.param(0, dtypes.uint32, R_WORDS * wave_size, name="r_reg"), "s_reg": UOp.param(1, dtypes.uint32, NUM_S_REG, name="s_reg"),
+            "c_reg": UOp.param(2, dtypes.uint32, NUM_C_REG, name="c_reg"), "a_reg": UOp.param(3, dtypes.uint32, NUM_A_REG, name="a_reg"),
+            "p_reg": UOp.param(4, dtypes.uint32, NUM_P_REG * wave_size, name="p_reg"),
+            "vmem": UOp.param(5, dtypes.uint8, 1<<48, name="vmem"),  # host VAs reach 2**47
+            "shared": UOp.param(6, dtypes.uint8, 32 * 1024, name="shared"), "pvt_mem": UOp.param(7, dtypes.uint8, 1 << 30, name="pvt_mem"),
+            "tmp": UOp.param(9, dtypes.uint32, 4 * wave_size, name="tmp")}  # scratch: swz/gat/sct park their sources here
+        self._exec_mask = UOp.param(8, dtypes.uint64, 1, name="exec_mask")
+        self.fused_lane: UOp | None = None
+        self.tex = UOp.param(10, dtypes.uint32, 16 * NUM_IMG_DESC, name="tex")  # 16-dword texture / IBO descriptors (A6XX_TEX_CONST)
+        self.ibo = UOp.param(11, dtypes.uint32, 16 * NUM_IMG_DESC, name="ibo")
+        for name, buf in self._bufs.items(): setattr(self, name, buf)
+
+    def advance(self, done: UOp) -> None:
+        """Make every later access to a buffer wait for `done` (a finished instruction), so instructions can share one kernel."""
+        for name, buf in self._bufs.items(): setattr(self, name, buf.after(done))
 
     def range(self, n: int | None = None) -> UOp:
+        if self.fused_lane is not None: return self.fused_lane  # instructions fused into one lane loop share its range
         if n is None: n = self.wave_size
         self._axis_id += 1
         return UOp.range(n, self._axis_id, dtype=dtypes.int)
@@ -273,8 +303,8 @@ def _qcom_reg_offset_token(token: str, delta: int) -> str:
 def _qcom_reg_component_offset_token(token: str, delta: int) -> str:
     """Advance a vector operand by components, carrying w into the next register's x."""
     kind, reg, dim = _qcom_reg_token(token)
-    if kind not in {"r", "hr"}:
-        raise NotImplementedError(f"Multi-component Cat6 accesses require r/hr registers, got {token!r}")
+    if kind not in {"r", "hr", "c", "hc", "s", "hs"}:
+        raise NotImplementedError(f"Multi-component accesses require r/c/s registers, got {token!r}")
     slot = reg * 4 + dim + delta
     dim_name = {0: "x", 1: "y", 2: "z", 3: "w"}[slot % 4]
     return f"{kind}{slot // 4}.{dim_name}"
@@ -315,6 +345,12 @@ def _qcom_encode_typed(value: UOp, typ: str) -> UOp:
     raise ValueError(f"Unsupported IR3 scalar type {typ!r}")
 
 
+def _qcom_u8_source_extends(src: UOp, src_type: str, dst_type: str) -> UOp:
+    """An 8-bit cov/mov source sign-extends: ir3_compiler_nir.c uses `cov.u8s16` for i2i16/i2f of int8 and masks with 0xff wherever it
+    needs zero extension ("Zero-extension of 8-bit values doesn't work with `cov`")."""
+    return src.bitcast(dtypes.int8) if src_type == "u8" and dst_type != "u8" else src
+
+
 def _compile_cat1(inst, ctx):
     if not inst.fields: raise RuntimeError(f"Category 1 instruction is missing a name: {inst!r}")
     name = _inst_name(inst).strip().lower()
@@ -338,9 +374,16 @@ def _compile_cat1(inst, ctx):
             src = inst.fields[5]
             vals = [_qcom_read_operand(ctx, _qcom_reg_component_offset_token(src.value, i), lane, src.modifiers) for i in range(4)]
             targets = [f.value for f in inst.fields[1:5]]
-        # these move in parallel (swz can swap two registers): no store may run before every source has been read
-        reads = UOp.group(*vals)
-        return UOp.sink(*[_write_qcom_store(ctx, dst, lane, val, after=reads) for dst, val in zip(targets, vals)])
+        # These move in parallel (swz can swap two registers), so every source is read before any destination is written. Within one
+        # kernel loop the scheduler is free to move a load past a store to the same word (two half registers share one), so the sources are
+        # parked in a scratch buffer by a first loop and written out by a second one. (_end_lane_range closes the first loop.)
+        parked = _end_lane_range(UOp.sink(*[ctx.tmp.index(lane * _c(4, dtypes.int) + _c(i, dtypes.int)).store(_as_reg_bits(v)) for i, v in enumerate(vals)]))
+        ctx.advance(parked)
+        lane = ctx.range()
+        stores: list[UOp] = []
+        for i, dst in enumerate(targets):  # chained: half destinations share words, so the read-modify-write stores must not overlap
+            stores.append(_write_qcom_store(ctx, dst, lane, ctx.tmp.index(lane * _c(4, dtypes.int) + _c(i, dtypes.int)).load(), after=stores[-1] if stores else None))
+        return UOp.sink(*stores)
 
     if len(inst.fields) < 3: raise RuntimeError(f"Category 1 instruction is missing operands: {inst!r}")
     dst_field, src_field = inst.fields[1], inst.fields[2]
@@ -349,7 +392,7 @@ def _compile_cat1(inst, ctx):
         pair = _qcom_split_type_pair(name.split(".", 1)[1])
         if pair is None: raise NotImplementedError(f"Unsupported conversion type pair in {name!r}")
         src_type, dst_type = pair
-        src = _qcom_read_typed_operand(ctx, src_field, lane, src_type)
+        src = _qcom_u8_source_extends(_qcom_read_typed_operand(ctx, src_field, lane, src_type), src_type, dst_type)
         result = _qcom_apply_instruction_flags(inst, _qcom_encode_typed(src, dst_type))
         return _write_qcom_value(ctx, dst_field.value, lane, result)
 
@@ -360,7 +403,7 @@ def _compile_cat1(inst, ctx):
         pair = _qcom_split_type_pair(suffix)
         if pair is not None:
             src_type, dst_type = pair
-            src = _qcom_read_typed_operand(ctx, src_field, lane, src_type)
+            src = _qcom_u8_source_extends(_qcom_read_typed_operand(ctx, src_field, lane, src_type), src_type, dst_type)
             result = _qcom_apply_instruction_flags(inst, _qcom_encode_typed(src, dst_type))
             return _write_qcom_value(ctx, dst_field.value, lane, result)
         result = _qcom_read_operand(ctx, src_field.value, lane, src_field.modifiers)
@@ -377,9 +420,11 @@ def _compile_cat1(inst, ctx):
     raise RuntimeError(f"Unsupported category 1 instruction: {name!r}")
 
 
+_BIT_DIGITS = bytes.maketrans(b'\x00\x01', b'01')
 _QCOM_REG_RE = re.compile(r"(?P<kind>[a-zA-Z]+)(?P<reg>\d+)(?:\.(?P<dim>x|y|z|w))?", re.IGNORECASE)
 
 
+@functools.cache
 def _qcom_reg_token(token: str) -> tuple[str, int, int]:
     token, _ = _split_qcom_modifiers(token)
     match = _QCOM_REG_RE.fullmatch(token.strip())
@@ -387,6 +432,8 @@ def _qcom_reg_token(token: str) -> tuple[str, int, int]:
     kind = match.group("kind").lower()
     reg = int(match.group("reg"))
     dim = {"x": 0, "y": 1, "z": 2, "w": 3}.get(match.group("dim") or "x", 0)
+    # a6xx has 48 per-lane GPRs; the registers numbered 48-55 are the wave-shared file (ir3 prints them as r48.x..r55.w)
+    if kind in {"r", "hr"} and reg >= 48: return "s" if kind == "r" else "hs", reg - 48, dim
     return kind, reg, dim
 
 
@@ -395,7 +442,10 @@ def _qcom_read_value(ctx: _Ctx, token: str, lane: UOp) -> UOp:
     if kind == "r": return ctx.read_r_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
     if kind == "hr": return ctx.read_r_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, half=True)
     if kind in {"s", "hs"}: return ctx.read_s_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), half=(kind == "hs"))
-    if kind in {"c", "hc"}: return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), half=(kind == "hc"))
+    if kind == "c": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int))
+    # CONSTANT_DEMOTION_ENABLE (set by ops_qcom for IR3): hcN.c is the full 32-bit constant cN.c, demoted for the half-precision reader.
+    # Integer readers see the low 16 bits (u2u16, done here); float readers convert f32->f16 (_qcom_demoted_const_f16). ir3_cp.c.
+    if kind == "hc": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int)) & _c(0xFFFF, dtypes.uint32)
     if kind == "a": return ctx.read_a_reg(_c(reg, dtypes.int))
     if kind == "p": return ctx.read_p_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
     raise ValueError(f"Unsupported QCOM register kind {kind!r} in {token!r}")
@@ -403,6 +453,9 @@ def _qcom_read_value(ctx: _Ctx, token: str, lane: UOp) -> UOp:
 
 def _parse_qcom_imm(token: str) -> UOp:
     token = token.strip()
+    if token.lower().startswith("h("): token = token[1:]  # half-precision immediate, h(255) / h(1.5) (ir3-common.xml #mulitsrc-immed, cat1 #cat1-immed-src)
+    if token.startswith("(") and token.endswith(")"): token = token[1:-1]
+    if token.lower() in _QCOM_FLUT_IMMS: return UOp.const(_QCOM_FLUT_IMMS[token.lower()], dtypes.float32)
     if token in {"0", "1"}:
         return _c(int(token), dtypes.uint32)
     if token.lower().lstrip("+-") in {"inf", "nan"}: return UOp.const(float(token), dtypes.float32)
@@ -436,6 +489,10 @@ def _qcom_read_operand(ctx: _Ctx, token: str, lane: UOp, modifiers: list[str] | 
 
 def _qcom_read_typed_operand(ctx: _Ctx, field, lane: UOp, typ: str) -> UOp:
     raw, mods = _qcom_read_raw_operand(ctx, field.value, lane, field.modifiers)
+    if typ == "f16" and _QCOM_REG_RE.fullmatch(field.value.strip()) and _qcom_reg_token(field.value)[0] == "hc":
+        return _apply_qcom_operand_modifiers(_qcom_demoted_const_f16(ctx, field.value), mods)
+    # signed integer ALU ops on half registers / h(imm) sources work on 16-bit values: sign-extend from bit 15, not from bit 31
+    if typ == "s32" and field.value.strip().lower().startswith("h"): return _apply_qcom_operand_modifiers(_qcom_decode_typed(raw, "s16").cast(dtypes.int32), mods)
     return _apply_qcom_operand_modifiers(_qcom_decode_typed(raw, typ), mods)
 
 def _round_nearest_even(x: UOp) -> UOp:
@@ -588,7 +645,7 @@ def _compile_cat2(inst, ctx):
     elif name == "xor.b": result = a.cast(dtypes.uint32) ^ b.cast(dtypes.uint32)
     elif name == "shl.b": result = a.cast(dtypes.uint32) << (b.cast(dtypes.uint32) & _c(31, dtypes.uint32))
     elif name == "shr.b": result = a.cast(dtypes.uint32) >> (b.cast(dtypes.uint32) & _c(31, dtypes.uint32))
-    elif name == "ashr.b": result = a.cast(dtypes.int32) >> (b.cast(dtypes.uint32) & _c(31, dtypes.uint32))
+    elif name == "ashr.b": result = signed_a >> (b.cast(dtypes.uint32) & _c(31, dtypes.uint32))  # signed_a: s16-extended for half sources
     elif name == "getbit.b": result = (a.cast(dtypes.uint32) >> (b.cast(dtypes.uint32) & _c(31, dtypes.uint32))) & _c(1, dtypes.uint32)
     elif name == "mull.u":
         # Mesa lowers nir umul_16x16 to mull.u: unsigned product of the low 16 bits of each source (32-bit result)
@@ -612,6 +669,14 @@ def _qcom_mem_dtype(suffix: str) -> Any:
     return mapping[suffix]
 
 
+def _mem_byte_index(ctx: _Ctx, mem_kind: str, addr_i: UOp, i: int, lane: UOp) -> UOp:
+    """Byte index of byte i of an access inside the memory buffer. Private memory is per lane: the emulator keeps one buffer per
+    wave and interleaves it by dword across the lanes (lane l's dword d lives at d*wave_size*4 + l*4), so every lane sees its own
+    p[...] space. The GPU VA in SP_CS_PVT_MEM_BASE is never read by shaders, so it does not need to be honoured."""
+    b = addr_i + _c(i, dtypes.int64)
+    if mem_kind != "p": return b
+    return (b >> _c(2, dtypes.int64)) * _c(ctx.wave_size * 4, dtypes.int64) + lane.cast(dtypes.int64) * _c(4, dtypes.int64) + (b & _c(3, dtypes.int64))
+
 def _load_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, suffix: str, lane: UOp) -> UOp:
     mem = {"g": ctx.vmem, "l": ctx.shared, "p": ctx.pvt_mem}[mem_kind]
     active = _thread_active(ctx.read_exec_mask(), lane)
@@ -622,7 +687,7 @@ def _load_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, suffix: str, lane: UOp)
     safe_addr = active.where(addr_i, _c(0, dtypes.int64))
     raw: UOp | None = None
     for i in range(nbytes):
-        byte = mem.index((safe_addr + _c(i, dtypes.int64)).valid(active)).load().cast(raw_dtype)
+        byte = mem.index(_mem_byte_index(ctx, mem_kind, safe_addr, i, lane).valid(active)).load().cast(raw_dtype)
         part = byte if i == 0 else byte << _c(8 * i, raw_dtype)
         raw = part if raw is None else raw | part
     assert raw is not None  # nbytes >= 1
@@ -654,7 +719,7 @@ def _store_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, value: UOp, suffix: st
     stores = []
     for i in range(nbytes):
         byte = (raw >> _c(8 * i, raw_dtype)).cast(dtypes.uint8) if i else raw.cast(dtypes.uint8)
-        stores.append(mem.index((addr_i + _c(i, dtypes.int64)).valid(active)).store(byte))
+        stores.append(mem.index(_mem_byte_index(ctx, mem_kind, addr_i, i, lane).valid(active)).store(byte))
     return stores
 
 
@@ -662,7 +727,7 @@ def _compile_cat3(inst, ctx):
     if not inst.fields: raise RuntimeError(f"Category 3 instruction is missing a name: {inst!r}")
     name = _inst_name(inst).strip().lower()
     if len(inst.fields) != 5: raise RuntimeError(f"Category 3 instruction requires destination and three sources: {inst!r}")
-    if name in {"madsh.u16", "madsh.m16", "mad.f16.mul2", "mad.f32.mul2", "mad.f16.div2", "mad.f32.div2"}:
+    if name in {"madsh.u16", "mad.f16.mul2", "mad.f32.mul2", "mad.f16.div2", "mad.f32.div2"}:
         raise NotImplementedError(f"Category 3 instruction {name!r} requires ISA-specific packed/scale semantics")
     lane = ctx.range()
     dst = inst.fields[1].value
@@ -681,6 +746,11 @@ def _compile_cat3(inst, ctx):
         if name.endswith("f16"):
             value = (f16(src_fields[0], a) * f16(src_fields[1], b) + f16(src_fields[2], c)).cast(dtypes.float16)
         else: value = _qcom_float_operand(ctx, src_fields[0], lane) * _qcom_float_operand(ctx, src_fields[1], lane) + _qcom_float_operand(ctx, src_fields[2], lane)
+    elif name == "madsh.m16":
+        # Mesa nir_op_imadsh_mix16 (ir3_compiler_nir.c shared-reg fallback): ((a & 0xffff) * (b >> 16)) << 16, plus c. imul is
+        # mull.u t,a,b; madsh.m16 t,a,b,t; madsh.m16 d,b,a,t.
+        a32, b32 = a.cast(dtypes.uint32), b.cast(dtypes.uint32)
+        value = (((a32 & _c(0xFFFF, dtypes.uint32)) * (b32 >> _c(16, dtypes.uint32))) << _c(16, dtypes.uint32)) + c.cast(dtypes.uint32)
     elif name == "mad.u16": value = (a.cast(dtypes.uint16).cast(dtypes.uint32) * b.cast(dtypes.uint16).cast(dtypes.uint32) + c.cast(dtypes.uint32)).cast(dtypes.uint32)
     elif name == "mad.s16": value = (a.cast(dtypes.uint16).bitcast(dtypes.int16).cast(dtypes.int32) * b.cast(dtypes.uint16).bitcast(dtypes.int16).cast(dtypes.int32) + c.cast(dtypes.int32)).cast(dtypes.int32)
     elif name == "mad.u24": value = ((a.cast(dtypes.uint32) & _c(0xFFFFFF, dtypes.uint32)) * (b.cast(dtypes.uint32) & _c(0xFFFFFF, dtypes.uint32)) + c.cast(dtypes.uint32)).cast(dtypes.uint32)
@@ -745,14 +815,109 @@ def _compile_cat4(inst, ctx):
     return _qcom_write_result(ctx, dst, lane, _qcom_apply_instruction_flags(inst, result))
 
 
+def _image_descriptor(ctx, buf: UOp, index: int) -> dict:
+    """Decode the A6XX_TEX_CONST descriptor `index` of a texture (SB6_CS_TEX) or IBO (SB6_CS_SHADER/ST6_UAV) array at run time: the
+    descriptors change with every dispatch, so they are read from a buffer rather than baked into the (cached) kernel."""
+    w = [buf.index(_c(index * 16 + k, dtypes.int)).load() for k in range(6)]
+    def field(word, mask, shift): return (w[word] & _c(mask, dtypes.uint32)) >> _c(shift, dtypes.uint32)
+    base = (w[4] & _c(mesa.A6XX_TEX_CONST_4_BASE_LO__MASK, dtypes.uint32)).cast(dtypes.uint64) | ((w[5] & _c(mesa.A6XX_TEX_CONST_5_BASE_HI__MASK, dtypes.uint32)).cast(dtypes.uint64) << _c(32, dtypes.uint64))
+    return {"w0": w[0], "base": base, "fmt": field(0, mesa.A6XX_TEX_CONST_0_FMT__MASK, mesa.A6XX_TEX_CONST_0_FMT__SHIFT),
+            "width": field(1, mesa.A6XX_TEX_CONST_1_WIDTH__MASK, mesa.A6XX_TEX_CONST_1_WIDTH__SHIFT).cast(dtypes.int),
+            "height": field(1, mesa.A6XX_TEX_CONST_1_HEIGHT__MASK, mesa.A6XX_TEX_CONST_1_HEIGHT__SHIFT).cast(dtypes.int),
+            "pitch": field(2, mesa.A6XX_TEX_CONST_2_PITCH__MASK, mesa.A6XX_TEX_CONST_2_PITCH__SHIFT).cast(dtypes.uint64)}
+
+
+def _texel_addr(desc: dict, x: UOp, y: UOp) -> tuple[UOp, UOp, UOp]:
+    """(byte address of texel (x, y), in-bounds, is_32bit_float_format) for a linear 2D image of RGBA32F or RGBA16F texels."""
+    inb = (x >= _c(0, dtypes.int)) & (x < desc["width"]) & (y >= _c(0, dtypes.int)) & (y < desc["height"])
+    is32 = desc["fmt"].eq(_c(mesa.FMT6_32_32_32_32_FLOAT, dtypes.uint32))
+    bpp = is32.where(_c(16, dtypes.uint64), _c(8, dtypes.uint64))
+    return desc["base"] + y.cast(dtypes.uint64) * desc["pitch"] + x.cast(dtypes.uint64) * bpp, inb, is32
+
+
+def _load_texel(ctx, desc: dict, x: UOp, y: UOp, lane: UOp, swizzle: bool) -> list[UOp]:
+    """The four float32 components of texel (x, y); zero outside the image (CLAMP_TO_BORDER with a transparent-black border)."""
+    addr, inb, is32 = _texel_addr(desc, x, y)
+    valid = inb & _thread_active(ctx.read_exec_mask(), lane)
+    comps = []
+    for i in range(4):
+        raw: UOp | None = None
+        for j in range(4):  # 4 bytes of an f32 component, only the first 2 of an f16 one (never read past the texel)
+            off = is32.where(_c(4 * i + j, dtypes.uint64), _c(2 * i + j, dtypes.uint64))
+            byte = ctx.vmem.index((addr + off).cast(dtypes.int64).valid(valid & (is32 | _c(j < 2, dtypes.bool)))).load().cast(dtypes.uint32)
+            raw = byte if raw is None else raw | (byte << _c(8 * j, dtypes.uint32))
+        assert raw is not None
+        comps.append(is32.where(raw.bitcast(dtypes.float32), raw.cast(dtypes.uint16).bitcast(dtypes.float16).cast(dtypes.float32)))
+    if not swizzle: return comps
+    out = []
+    for shift, mask in ((mesa.A6XX_TEX_CONST_0_SWIZ_X__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_X__MASK), (mesa.A6XX_TEX_CONST_0_SWIZ_Y__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_Y__MASK),
+                        (mesa.A6XX_TEX_CONST_0_SWIZ_Z__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_Z__MASK), (mesa.A6XX_TEX_CONST_0_SWIZ_W__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_W__MASK)):
+        sel = (desc["w0"] & _c(mask, dtypes.uint32)) >> _c(shift, dtypes.uint32)  # 0..3 = R,G,B,A, 4 = zero, 5 = one
+        v = sel.eq(_c(4, dtypes.uint32)).where(UOp.const(0.0, dtypes.float32), UOp.const(1.0, dtypes.float32))
+        for c in (3, 2, 1, 0): v = sel.eq(_c(c, dtypes.uint32)).where(comps[c], v)
+        out.append(v)
+    return out
+
+
+def _store_texel(ctx, desc: dict, x: UOp, y: UOp, values: list[UOp], lane: UOp) -> list[UOp]:
+    """Write four float32 values as texel (x, y); out of bounds writes are dropped."""
+    addr, inb, is32 = _texel_addr(desc, x, y)
+    valid = inb & _thread_active(ctx.read_exec_mask(), lane)
+    stores = []
+    for j in range(16):
+        f32_byte = (values[j // 4].bitcast(dtypes.uint32) >> _c(8 * (j % 4), dtypes.uint32)) & _c(0xFF, dtypes.uint32)
+        f16_comp = j // 2
+        f16_byte = ((values[f16_comp].cast(dtypes.float16).bitcast(dtypes.uint16).cast(dtypes.uint32) >> _c(8 * (j % 2), dtypes.uint32)) & _c(0xFF, dtypes.uint32)) if j < 8 else _c(0, dtypes.uint32)
+        byte = is32.where(f32_byte, f16_byte).cast(dtypes.uint8)
+        stores.append(ctx.vmem.index((addr + _c(j, dtypes.uint64)).cast(dtypes.int64).valid(valid & (is32 | _c(j < 8, dtypes.bool)))).store(byte))
+    return stores
+
+
+def _write_texel_result(ctx, lane: UOp, dst: str, comps: list[UOp], wrmask: str, typ: str) -> UOp:
+    """Results of a texture/image load are written to consecutive registers, one per set bit of the write mask."""
+    if typ not in {"f32", "f16"}: raise NotImplementedError(f"image/texture data type {typ!r} is not implemented")
+    stores: list[UOp] = []
+    for n, c in enumerate("xyzw"):
+        if c not in wrmask: continue
+        v = comps["xyzw".index(c)]
+        stores.append(_write_qcom_store(ctx, _qcom_reg_component_offset_token(dst, len(stores)), lane, v.cast(dtypes.float16) if typ == "f16" else v, after=stores[-1] if stores else None))
+    return UOp.sink(*stores)
+
+
 def _compile_cat5(inst, ctx):
     if not inst.fields: raise RuntimeError(f"Category 5 instruction is missing a name: {inst!r}")
     name = _inst_name(inst).strip().lower()
-    # Cat5 is not a homogeneous ALU category. It includes sampling/gather operations which
-    # require decoded A6xx texture/sampler descriptors, plus derivative/quad operations whose
-    # semantics depend on lane neighborhoods. No implementation should fake these as an ALU
-    # pass-through. Keep this boundary explicit until those execution models exist.
-    raise NotImplementedError(f"Category 5 instruction {name!r} requires texture descriptors or quad/subgroup execution semantics")
+    # Only isam (integer-coordinate texel fetch, which is what ir3 emits for a read-only image_load) is modelled. The rest of cat5 (filtered
+    # sampling, gathers, derivatives, bindless / indirect s2en forms) needs sampler state or quad execution semantics, so it must not be faked.
+    if name != "isam.1d" or len(inst.fields) != 5 or not (inst.fields[3].value.startswith("s#") and inst.fields[4].value.startswith("t#")):
+        raise NotImplementedError(f"Category 5 instruction {name!r} requires sampler state or quad/subgroup execution semantics")
+    dst = inst.fields[1]
+    typ = next((m for m in dst.modifiers if m in _QCOM_TEX_TYPES), "f32")
+    wrmask = next((m for m in dst.modifiers if re.fullmatch(r"[xyzw]{1,4}", m)), "xyzw")
+    lane = ctx.range()
+    x = _qcom_read_operand(ctx, inst.fields[2].value, lane).cast(dtypes.uint32).bitcast(dtypes.int32)
+    y = _qcom_read_operand(ctx, _qcom_reg_component_offset_token(inst.fields[2].value, 1), lane).cast(dtypes.uint32).bitcast(dtypes.int32)
+    desc = _image_descriptor(ctx, ctx.tex, int(inst.fields[4].value[2:]))
+    return _write_texel_result(ctx, lane, dst.value, _load_texel(ctx, desc, x, y, lane, swizzle=True), wrmask, typ)
+
+
+def _compile_image_buffer_op(inst, ctx):
+    """cat6 stib / ldib: typed 2D image store / load through an IBO descriptor, e.g. `stib.b.typed.2d.f32.4.imm r2.y, r1.w, 0`."""
+    name = _inst_name(inst).strip().lower()
+    parts = name.split(".")
+    if len(parts) != 7 or parts[1:4] != ["b", "typed", "2d"] or parts[4] not in {"f32", "f16"} or parts[5] != "4" or parts[6] != "imm" or len(inst.fields) != 4:
+        raise NotImplementedError(f"image instruction {name!r} (only typed 2d f32/f16 x4 with an immediate IBO index is implemented)")
+    op, typ = parts[0], parts[4]
+    lane = ctx.range()
+    reg, coord = inst.fields[1].value, inst.fields[2].value
+    if op == "stib" and typ == "f16" and _qcom_reg_token(reg)[0] == "r": reg = "h" + reg  # the disassembler omits the "h" on store sources
+    x = _qcom_read_operand(ctx, coord, lane).cast(dtypes.uint32).bitcast(dtypes.int32)
+    y = _qcom_read_operand(ctx, _qcom_reg_component_offset_token(coord, 1), lane).cast(dtypes.uint32).bitcast(dtypes.int32)
+    desc = _image_descriptor(ctx, ctx.ibo, int(inst.fields[3].value, 0))
+    if op == "ldib": return _write_texel_result(ctx, lane, reg, _load_texel(ctx, desc, x, y, lane, swizzle=False), "xyzw", typ)
+    reads = [_qcom_read_operand(ctx, _qcom_reg_component_offset_token(reg, i), lane) for i in range(4)]
+    values = [(_as_float16(r) if typ == "f16" else _as_float32(r)) for r in reads]
+    return UOp.sink(*_store_texel(ctx, desc, x, y, values, lane))
 
 
 def _qcom_read_mem_address(ctx, token: str, lane: UOp) -> tuple[str, UOp]:
@@ -792,6 +957,7 @@ def _qcom_read_mem_address(ctx, token: str, lane: UOp) -> tuple[str, UOp]:
 def _compile_cat6(inst, ctx):
     if not inst.fields: raise RuntimeError(f"Category 6 instruction is missing a name: {inst!r}")
     name = _inst_name(inst).strip().lower()
+    if name.startswith(("stib", "ldib")): return _compile_image_buffer_op(inst, ctx)
     # .a has a distinct complex-address encoding; .k loads constants through a special path.
     # These are mnemonic components (e.g. ldg.a.f32), not necessarily suffixes.
     mode_parts = name.split(".")[1:]
@@ -822,18 +988,22 @@ def _compile_cat6(inst, ctx):
         if space != mem_kind: raise RuntimeError(f"{name} uses {mem_kind}[...] but operand addresses {space}[...]")
         if count > 1 and _qcom_reg_token(dst)[0] not in {"r", "hr"}:
             raise NotImplementedError(f"Multi-component {name} destination must be an r/hr register, got {dst!r}")
-        stores = []
+        stores: list[UOp] = []
         for i in range(count):
             dst_i = _qcom_reg_component_offset_token(dst, i) if count > 1 else dst
             addr_i = addr + _c(i * dtype.itemsize, addr.dtype)
             value = _load_mem_value(ctx, mem_kind, addr_i, dtype_suffix, lane)
-            stores.append(_write_qcom_store(ctx, dst_i, lane, value))
+            # two half registers share one 32-bit word, so the writes must be ordered (each is a read-modify-write of that word)
+            stores.append(_write_qcom_store(ctx, dst_i, lane, value, after=stores[-1] if stores else None))
         return UOp.sink(*stores)
 
     if op.startswith("st"):
         space, addr = _qcom_read_mem_address(ctx, inst.fields[1].value, lane)
         if space != mem_kind: raise RuntimeError(f"{name} uses {mem_kind}[...] but operand addresses {space}[...]")
         src_token = inst.fields[2].value
+        # u8/u16/s16/f16 stores read a half register (ir3-common.xml #type-half), but the disassembler leaves the "h" off stl/stp
+        # sources (it is printed for stg), e.g. "stp.u16 p[r24.x+6], r37.y" after "ldg.u16 hr36.z, ..., 4": same register number.
+        if dtype_suffix.strip().lower() in {"u8", "u16", "s16", "f16"} and _qcom_reg_token(src_token)[0] == "r": src_token = "h" + src_token
         if count > 1 and _qcom_reg_token(src_token)[0] not in {"r", "hr"}:
             raise NotImplementedError(f"Multi-component {name} source must be an r/hr register, got {src_token!r}")
         stores = []
@@ -859,11 +1029,26 @@ def _compile_cat7(inst, ctx):
     raise RuntimeError(f"Unsupported category 7 instruction: {name!r}")
 
 
+def _expand_repeat(inst: "Inst") -> "list[Inst]":
+    """(rptN) on cat1-4 runs the instruction N+1 times, in order. Each run steps the destination and every (r)-flagged source
+    register by one more component (w carries into the next register's x); sources without (r) are re-read unchanged (ir3.h:
+    `(rpt2)mad.f32 r3.y, (r)c9.x, r1.x, (r)r3.z`). On cat0 the same field is the (nopN) count, so nothing repeats there."""
+    if inst.cat not in {1, 2, 3, 4} or not inst.fields: return [inst]
+    rpt = [int(m[3:]) for m in inst.fields[0].modifiers if re.fullmatch(r"rpt\d+", m)]
+    if not rpt or _inst_name(inst).strip().lower() == "nop": return [inst]
+    name = Field(inst.fields[0].value, tuple(m for m in inst.fields[0].modifiers if m != f"rpt{rpt[0]}"))
+    ret = []
+    for i in range(rpt[0] + 1):
+        fields = [name]
+        for j, f in enumerate(inst.fields[1:], 1):
+            value = f.value
+            if _QCOM_REG_RE.fullmatch(value.strip()) and (j == 1 or "r" in f.modifiers): value = _qcom_reg_component_offset_token(value, i)
+            fields.append(Field(value, tuple(m for m in f.modifiers if m != "r")))
+        ret.append(Inst(inst.cat, tuple(fields)))
+    return ret
+
 def _compile_inst(inst, ctx):
-    # (rptN) executes the instruction N+1 times, advancing dst and every (r)-flagged source by one component each time.
-    # That expansion is not modelled yet, and ignoring it would silently compute only the first element.
-    if inst.fields and _inst_name(inst).strip().lower() != "nop" and any(re.fullmatch(r"rpt[1-9]\d*", m) for m in inst.fields[0].modifiers):
-        raise NotImplementedError(f"(rpt) repeat on {_inst_name(inst)!r} is not implemented")
+    if len(_expand_repeat(inst)) > 1: raise RuntimeError(f"(rptN) must be expanded with _expand_repeat before compiling: {inst!r}")
     if inst.cat == 0:
         return _compile_cat0(inst, ctx)
     elif inst.cat == 1:
@@ -884,30 +1069,99 @@ def _compile_inst(inst, ctx):
 
 def _end_lane_range(sink):
     # every compile function builds its per-lane work inside one ctx.range(); close it here (like the AMD emulator's .end(lane))
-    rngs = [u for u in sink.toposort() if u.op is Ops.RANGE]
+    rngs = list(sink.ranges)  # the still-open ranges: earlier instructions of a fused block are already ended
     assert len(rngs) <= 1, f"expected at most one lane range, got {len(rngs)}"
     return UOp.sink(sink.end(*rngs)) if rngs else sink
 
-@functools.cache
-def _get_runner(inst, merged=False):
-    ctx = _Ctx(merged=merged)
-    sink = _end_lane_range(_compile_inst(inst, ctx)).replace(arg=KernelInfo(name=f"qcom_{_inst_name(inst)}"))
-    with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
-        prg = to_program(sink, Device['CPU'].renderer)
-        runtime = get_runtime('CPU', prg)
-    return prg, runtime
+# Lowering a run of instructions to a CPU kernel costs tens of ms per instruction in graph rewrites and a real kernel has hundreds of
+# them, so lowered programs are kept on disk, keyed by the instructions and by the part of this file that decides what a kernel computes
+# (NUM_R_REG up to WaveState; editing the imports or the scheduler does not invalidate them).
+_src = pathlib.Path(__file__).read_text()
+_EMU_SRC_HASH = hashlib.sha256(_src[_src.index("NUM_R_REG"):_src.index("class WaveState")].encode()).hexdigest()  # not the imports above it
 
-def _compile_at(pc, decoded_shader, merged=False):
-    inst = decoded_shader[pc]
-    try: return _get_runner(inst, merged), inst
-    except Exception as e:
-        try: inst_str = repr(inst)
-        except Exception: inst_str = f"<{type(inst).__name__}>"
-        raise RuntimeError(f"[emu] Failed to compile {inst_str}: {type(e).__name__}: {e}") from e
+MAX_BLOCK = int(os.environ.get("QCOM_EMU_MAX_BLOCK", "48"))  # longest run of instructions fused into one kernel (compile time grows faster than linearly past this)
+
+def _block_key(insts: tuple, merged: bool) -> dict:
+    return {"emu": _EMU_SRC_HASH, "insts": hashlib.sha256(repr(insts).encode()).hexdigest(), "merged": int(merged)}
+
+def _is_lane_local(inst: "Inst") -> bool:
+    """ALU-style instructions only touch their own lane's registers, so a run of them can share one loop over the lanes."""
+    return inst.cat in {1, 2, 3, 4} and not _inst_name(inst).startswith(("swz", "gat", "sct", "mova", "movs", "movmsk"))
+
+
+def _lower_block(insts: tuple, merged: bool, renderer=None):
+    """Lower a straight-line run of instructions (each (rptN) already expanded) to one CPU program; False if there is no work."""
+    with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
+        ctx = _Ctx(merged=merged)
+        sinks: list[UOp] = []
+        group: list[UOp] = []  # consecutive lane-local instructions share one loop over the lanes (the values stay in registers in between)
+
+        def flush():
+            if not group: return
+            sinks.append(sink:=_end_lane_range(UOp.sink(*group)))
+            ctx.advance(sink)
+            group.clear()
+            ctx.fused_lane = None
+        for inst in insts:
+            if _is_lane_local(inst):
+                if ctx.fused_lane is None: ctx.fused_lane = ctx.range()  # the first instruction of a group opens the loop
+                sink = _compile_inst(inst, ctx)
+                if sink.op is Ops.SINK and not sink.src: continue
+                group.append(sink)
+                ctx.advance(sink)  # later instructions of the loop read what this one wrote (same lane, so only ordering is needed)
+            else:
+                flush()
+                ctx.fused_lane = None
+                sink = _end_lane_range(_compile_inst(inst, ctx))
+                if sink.op is Ops.SINK and not sink.src: continue  # nop-like: nothing to run
+                sinks.append(sink)
+                ctx.advance(sink)
+        flush()
+        if not sinks: return False
+        return to_program(UOp.sink(*sinks).replace(arg=KernelInfo(name=f"qcom_{_inst_name(insts[0])}_x{len(insts)}")), renderer or Device['CPU'].renderer)
+
+_lower_block_task = lambda args: (args[0], _lower_block(*args[1:]))  # noqa: E731  (pool task: worker processes cannot open devices, so the renderer is passed in)
+
+_PROGRAMS: dict[tuple[str, bool], Any] = {}  # lowered programs seen by this process, by key
+
+def _load_program(insts: tuple, merged: bool, lower: bool = True):
+    key = _block_key(insts, merged)
+    if (prg:=_PROGRAMS.get((key["insts"], merged))) is None and (prg:=diskcache_get("qcom_emu_block", key)) is None and lower:
+        prg = diskcache_put("qcom_emu_block", key, _lower_block(insts, merged))
+    if prg is not None: _PROGRAMS[(key["insts"], merged)] = prg
+    return prg
+
+@functools.cache
+def _get_block_runner(insts: tuple, merged=False):
+    """The runnable kernel for a straight-line run of instructions, or None if the run has no work."""
+    prg = _load_program(insts, merged)
+    with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
+        return (prg, get_runtime('CPU', prg)) if prg is not False else None
+
+def _precompile(blocks: list[tuple], merged: bool) -> None:
+    """Lower every block of a shader that is not cached yet, in tinygrad's worker pool (a cold shader has hundreds)."""
+    todo = {k["insts"]: b for b in blocks if _load_program(b, merged, lower=False) is None and (k:=_block_key(b, merged))}
+    if len(todo) < 6 or (pool:=get_worker_pool()) is None: return  # not worth the round trips / no workers: compiled when first run
+    renderer, keys = Device['CPU'].renderer, list(todo)
+    try:
+        for i, prg in pool.imap_unordered(_lower_block_task, [(i, todo[k], merged, renderer) for i, k in enumerate(keys)]):
+            diskcache_put("qcom_emu_block", _block_key(todo[keys[i]], merged), prg)
+            _PROGRAMS[(keys[i], merged)] = prg
+    except Exception: pass  # an unsupported instruction: it is reported with its name if the block is ever run
+
+def _compile_run(pc, decoded_shader, n, merged=False):
+    """Compile instructions [pc, pc+n) as one kernel; the error names the instruction that failed."""
+    insts = tuple(i for inst in decoded_shader[pc:pc+n] for i in _expand_repeat(inst))
+    try: return _get_block_runner(insts, merged)
+    except Exception:
+        for inst in insts:  # find the culprit for the message
+            try: _end_lane_range(_compile_inst(inst, _Ctx(merged=merged)))
+            except Exception as e: raise RuntimeError(f"[emu] Failed to compile {inst!r}: {type(e).__name__}: {e}") from e
+        raise
 
 
 class WaveState:
-    __slots__ = ("wave_size", "wave_idx", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "_r_reg_mv", "_s_reg_mv", "_c_reg_mv", "_hr_reg_mv", "_hs_reg_mv", "_hc_reg_mv", "_a_reg_mv", "_p_reg_mv", "pc", "exec_mask", "exec_mask_buf", "_exec_mask_mv", "lane_mask", "predication_mask", "predication_mode", "barrier_waiting", "call_stack", "mergedregs")
+    __slots__ = ("wave_size", "wave_idx", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "_r_reg_mv", "_s_reg_mv", "_c_reg_mv", "_hr_reg_mv", "_hs_reg_mv", "_hc_reg_mv", "_a_reg_mv", "_p_reg_mv", "pc", "exec_mask", "exec_mask_buf", "_exec_mask_mv", "lane_mask", "predication_mask", "predication_mode", "barrier_waiting", "call_stack", "mergedregs", "parked", "launch_mask")
 
     def __init__(
         self, wave_size, wave_idx,
@@ -918,7 +1172,9 @@ class WaveState:
         self.mergedregs = mergedregs
         self.wave_idx = wave_idx
         active_lanes = min(wave_size, max(0, math.prod(local_dims) - wave_idx * wave_size))
-        self.lane_mask = (1 << active_lanes) - 1
+        self.launch_mask = (1 << active_lanes) - 1
+        self.lane_mask = (1 << active_lanes) - 1  # lanes currently running; lanes waiting at a reconvergence point are removed (see parked)
+        self.parked: dict[int, int] = {}  # pc -> lanes parked there by a divergent branch, rejoined when the wave reaches that pc
         self.exec_mask = self.lane_mask
         self.exec_mask_buf = Buffer('CPU', 8).ensure_allocated()
         self._exec_mask_mv = self.exec_mask_buf.host.view(fmt='Q').mv
@@ -964,9 +1220,8 @@ class WaveState:
 
         # Each *regid is (register << 2 | first component) with 0xFC meaning "unused" (Mesa INVALID_REG); a vec3 occupies
         # three consecutive components, which may start mid-register (ir3_find_sysval_regid / create_sysval_input mask 0x7).
-        if wgidconstid != 0xFC:
-            for i in range(3):
-                self._write_c_reg((wgidconstid + i) >> 2, (wgidconstid + i) & 3, wgid[i])
+        # (tinygrad's shaders read the workgroup id from r48.x/y/z, i.e. the shared file, so a register id >= 48 lands there)
+        self._write_wgid(wgidconstid, wgid)
         if wgsizeconstid != 0xFC:
             for i in range(3):
                 self._write_c_reg((wgsizeconstid + i) >> 2, (wgsizeconstid + i) & 3, wgsize[i])
@@ -1026,10 +1281,33 @@ class WaveState:
         for lane in range(self.wave_size):
             self._p_reg_mv[lane * NUM_P_REG + reg_num * 4 + reg_dim] = (val >> lane) & 1
     def _read_p_reg(self, reg_num, reg_dim):
-        mask = 0
-        for lane in range(self.wave_size):
-            if self._p_reg_mv[lane * NUM_P_REG + reg_num * 4 + reg_dim]: mask |= 1 << lane
-        return mask
+        # one 0/1 word per lane, NUM_P_REG words apart: take that word's low byte for every lane and read the bytes as binary digits
+        raw = ctypes.string_at(self.p_reg._buf, self.wave_size * NUM_P_REG * 4)
+        return int(raw[(reg_num * 4 + reg_dim) * 4::NUM_P_REG * 4].translate(_BIT_DIGITS)[::-1], 2)
+
+    def _write_wgid(self, wgidconstid, wgid):
+        # (tinygrad's shaders read the workgroup id from r48.x/y/z, i.e. the shared file, so a register id >= 48 lands there)
+        if wgidconstid == 0xFC: return
+        for i in range(3):
+            reg = (wgidconstid + i) >> 2
+            if reg >= 48: self._write_s_reg(reg - 48, (wgidconstid + i) & 3, wgid[i])
+            else: self._write_c_reg(reg, (wgidconstid + i) & 3, wgid[i])
+
+    def snapshot(self) -> tuple[bytes, bytes, bytes]:
+        """The register images a fresh wave starts from (everything but the workgroup id is the same for every workgroup)."""
+        return (ctypes.string_at(self.r_reg._buf, R_WORDS * self.wave_size * 4), ctypes.string_at(self.c_reg._buf, NUM_C_REG * 4),
+                ctypes.string_at(self.s_reg._buf, NUM_S_REG * 4))
+
+    def reset(self, images: tuple[bytes, bytes, bytes], wgidconstid, wgid) -> None:
+        """Return to the state at the start of a workgroup without reallocating anything."""
+        for buf, img in zip((self.r_reg, self.c_reg, self.s_reg), images): ctypes.memmove(buf._buf, img, len(img))
+        ctypes.memset(self.a_reg._buf, 0, NUM_A_REG * 4)
+        ctypes.memset(self.p_reg._buf, 0, NUM_P_REG * self.wave_size * 4)
+        self._write_wgid(wgidconstid, wgid)
+        self.lane_mask = self.exec_mask = self.launch_mask
+        self._exec_mask_mv[0] = self.exec_mask
+        self.parked = {}
+        self.predication_mask, self.predication_mode, self.barrier_waiting, self.call_stack, self.pc = 0, "none", False, [], 0
 
 def _init_wave(
     shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
@@ -1111,7 +1389,11 @@ def _combine_predicated_exec_mask(exec_mask: int, predication_mask: int, mode: s
 _QCOM_INSTRUCTION_CONTROL_FLAGS = {"jp", "sy", "ss", "eq", "eolm", "eogm", "eostsc", "sat"}
 _QCOM_RESULT_FLAGS = {"sat"}
 _QCOM_REGISTER_QUALIFIERS = {"r", "rel"}
+_QCOM_TEX_TYPES = {"f32", "f16", "u32", "u16", "s32", "s16", "u8"}  # cat5 "(f32)(xyzw)r2.y": data type and component write mask of the result
 _QCOM_OPERAND_VALUE_MODIFIERS = {"neg", "n", "abs", "a", "bnot", "not"}
+# the float lookup-table immediates of ir3-common.xml (#flut); the disassembler prints the ones that are not plain numbers by name
+_QCOM_FLUT_IMMS = {"e": math.e, "pi": math.pi, "1/pi": 1/math.pi, "1/log2(e)": 1/math.log2(math.e), "log2(e)": math.log2(math.e),
+                   "1/log2(10)": 1/math.log2(10), "log2(10)": math.log2(10)}
 _QCOM_FLOAT_IMM_RE = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+e[+-]?\d+|inf|nan)", re.IGNORECASE)
 
 
@@ -1132,8 +1414,8 @@ def _split_qcom_modifiers(token: str) -> tuple[str, list[str]]:
             break
         mod = match.group(1).strip().lower()
         # The Mesa disassembler prints float immediates in parentheses, e.g. "add.f r2.w, r2.w, (1.0)".
-        if _QCOM_FLOAT_IMM_RE.fullmatch(mod) and match.end() == len(expr): return mod, mods
-        if mod in _QCOM_OPERAND_VALUE_MODIFIERS or mod in _QCOM_RESULT_FLAGS or re.fullmatch(r"rpt\d+", mod):
+        if (_QCOM_FLOAT_IMM_RE.fullmatch(mod) or mod in _QCOM_FLUT_IMMS) and match.end() == len(expr): return mod, mods
+        if mod in _QCOM_OPERAND_VALUE_MODIFIERS or mod in _QCOM_RESULT_FLAGS or mod == "r" or re.fullmatch(r"rpt\d+", mod) or mod in _QCOM_TEX_TYPES or re.fullmatch(r"[xyzw]{1,4}", mod):
             mods.append(mod)
         expr = expr[match.end():].strip()
     return expr, mods
@@ -1283,49 +1565,103 @@ def _predicate_mask(state: WaveState, token: str) -> int:
     return ((~value) & state.lane_mask) if invert else value
 
 
-def _execute_cat0_branch(inst: Inst, state: WaveState, pc: int, jump_locations: dict[str, int], shader_len: int) -> int:
-    """Execute the branch subset needed by compute shaders; return the next PC."""
+def _branch_info(inst: Inst, pc: int, jump_locations: dict[str, int], shader_len: int) -> tuple:
+    """Everything a cat0 branch needs, parsed once: (name, target, ((invert, p register, component), ...))."""
     name = _inst_name(inst).strip().lower()
+    if name in {"call", "jump"} and len(inst.fields) < 2: raise RuntimeError(f"IR3 {name} missing target: {inst!r}")
+    target = _branch_target(inst.fields[-1].value, pc, jump_locations, shader_len) if name != "ret" else -1
+    if name in {"ret", "call", "jump"}: return name, target, ()
+    preds = []
+    for tok in (f.value for f in inst.fields[1:-1] if f.value.lstrip("!").startswith("p")):
+        kind, reg, comp = _qcom_reg_token(tok.lstrip("!"))
+        if kind != "p": raise NotImplementedError(f"Cat0 branch predicate must be pN.component, got {tok!r}")
+        preds.append((tok.startswith("!"), reg, comp))
+    if not preds: raise RuntimeError(f"IR3 {name} missing predicate operand(s): {inst!r}")
+    if name in {"brao", "braa"} and len(preds) != 2: raise RuntimeError(f"IR3 {name} expects two predicates: {inst!r}")
+    if name not in {"br", "bany", "ball", "brao", "braa"}: raise NotImplementedError(f"IR3 branch {name!r} is not implemented")
+    return name, target, tuple(preds)
+
+
+def _execute_cat0_branch(info: tuple, state: WaveState, pc: int) -> int:
+    """Execute the branch subset needed by compute shaders; return the next PC."""
+    name, target, preds = info
     if name == "ret":
         if not state.call_stack: raise RuntimeError(f"IR3 ret at PC {pc} with an empty call stack")
         return state.call_stack.pop()
     if name == "call":
-        if len(inst.fields) < 2: raise RuntimeError(f"IR3 call missing target: {inst!r}")
         state.call_stack.append(pc + 1)
-        return _branch_target(inst.fields[-1].value, pc, jump_locations, shader_len)
-    if name == "jump":
-        if len(inst.fields) < 2: raise RuntimeError(f"IR3 jump missing target: {inst!r}")
-        return _branch_target(inst.fields[-1].value, pc, jump_locations, shader_len)
+        return target
+    if name == "jump": return _goto(state, pc, target)
 
-    # br is divergent in general. This scalar-PC wave scheduler can handle uniform
-    # conditions; for bany/ball the reduction itself is uniform. Divergent branches
-    # require a reconvergence/branch-stack model and must not be approximated.
-    pred_fields = [f.value for f in inst.fields[1:-1] if f.value.lstrip("!").startswith("p")]
-    if not pred_fields: raise RuntimeError(f"IR3 {name} missing predicate operand(s): {inst!r}")
-    masks = [_predicate_mask(state, tok) for tok in pred_fields]
+    # a6xx divergence model (ir3_reconvergence.c): lanes that take a branch to a later block are "parked" there while the others
+    # carry on; parked lanes rejoin when the wave reaches that pc (the (jp) reconvergence point). For a backward branch the lanes
+    # that leave the loop park at the next instruction instead. Predication (predt/predf) never parks lanes.
+    masks = [(state._read_p_reg(reg, comp) ^ (state.launch_mask if invert else 0)) & state.launch_mask for invert, reg, comp in preds]
     active = state.exec_mask & state.lane_mask
-    if name == "br":
-        true_lanes = masks[0] & active
-        false_lanes = active & (~masks[0] & state.lane_mask)
-        if true_lanes and false_lanes:
-            raise NotImplementedError(f"Divergent br at PC {pc} requires branch reconvergence")
-        take = bool(true_lanes)
-    elif name == "bany": take = bool(masks[0] & active)
-    elif name == "ball": take = bool(active) and (masks[0] & active) == active
-    elif name in {"brao", "braa"}:
-        if len(masks) != 2: raise RuntimeError(f"IR3 {name} expects two predicates: {inst!r}")
-        combined = (masks[0] | masks[1]) if name == "brao" else (masks[0] & masks[1])
-        true_lanes, false_lanes = combined & active, active & (~combined & state.lane_mask)
-        if true_lanes and false_lanes:
-            raise NotImplementedError(f"Divergent {name} at PC {pc} requires branch reconvergence")
-        take = bool(true_lanes)
-    else: raise NotImplementedError(f"IR3 branch {name!r} is not implemented")
-    return _branch_target(inst.fields[-1].value, pc, jump_locations, shader_len) if take else pc + 1
+    if name == "br": taken = masks[0] & active
+    elif name == "bany": taken = active if masks[0] & active else 0  # bany/ball reduce over the wave, so they never diverge
+    elif name == "ball": taken = active if active and (masks[0] & active) == active else 0
+    else: taken = ((masks[0] | masks[1]) if name == "brao" else (masks[0] & masks[1])) & active
+    if taken == active: return _goto(state, pc, target)
+    if not taken: return pc + 1
+    if target > pc: _park(state, target, taken)  # forward: the taken lanes wait at the target
+    else: _park(state, pc + 1, active & ~taken)  # backward: the lanes leaving the loop wait after it
+    return pc + 1 if target > pc else target
+
+
+def _refresh_exec_mask(state: WaveState) -> None:
+    state.exec_mask = state.lane_mask if state.predication_mode == "none" else _combine_predicated_exec_mask(
+        state.lane_mask, state.predication_mask, state.predication_mode, state.wave_size)
+    state._exec_mask_mv[0] = state.exec_mask & 0xFFFFFFFFFFFFFFFF
+
+
+def _park(state: WaveState, pc: int, lanes: int) -> None:
+    state.parked[pc] = state.parked.get(pc, 0) | lanes
+    state.lane_mask &= ~lanes
+    _refresh_exec_mask(state)
+
+
+def _goto(state: WaveState, pc: int, target: int) -> int:
+    """All running lanes go to target. A forward jump over a pc where lanes are parked cannot skip it: the lanes park at the
+    target and the wave falls through (with nothing running) to the parked pc."""
+    if target > pc and any(pc < k < target for k in state.parked):
+        _park(state, target, state.lane_mask)
+        return pc + 1
+    return target
+
+
+def _unpark(state: WaveState, pc: int) -> None:
+    state.lane_mask |= state.parked.pop(pc)
+    _refresh_exec_mask(state)
+
+
+def _dump_lane0(st: WaveState) -> str:
+    full = {f"r{i // 4}.{'xyzw'[i % 4]}": st._r_reg_mv[i] for i in range(NUM_R_REG) if st._r_reg_mv[i]}
+    half_base = 0 if st.mergedregs else NUM_R_REG * 2
+    half = {f"hr{i // 4}.{'xyzw'[i % 4]}": st._hr_reg_mv[half_base + i] for i in range(NUM_R_REG * 2) if st._hr_reg_mv[half_base + i]}
+    return " ".join(f"{k}={v:#x}" for k, v in {**full, **half}.items())
 
 
 def _barrier_resume_ready(waves: list[WaveState]) -> bool:
     if not waves: return False
     return all(w.barrier_waiting for w in waves)
+
+
+def _descriptor_buffer(words, what: str) -> Buffer:
+    """Descriptors as loaded by CP_LOAD_STATE6 (16 dwords each) in a buffer the kernels can read. Only what the instructions above model
+    is accepted: linear 2D RGBA32F / RGBA16F images; anything else would be silently misread, so it is refused up front."""
+    words = list(words)[:16 * NUM_IMG_DESC]
+    buf = Buffer('CPU', 16 * NUM_IMG_DESC * 4).ensure_allocated()
+    ctypes.memset(buf._buf, 0, 16 * NUM_IMG_DESC * 4)
+    for i, w in enumerate(words): ctypes.c_uint32.from_address(buf._buf + 4 * i).value = int(w)
+    for d in range(len(words) // 16):
+        d0, d2, d4 = words[16 * d], words[16 * d + 2], words[16 * d + 4]
+        if not d4 and not words[16 * d + 5]: continue  # unused slot
+        fmt = (d0 & mesa.A6XX_TEX_CONST_0_FMT__MASK) >> mesa.A6XX_TEX_CONST_0_FMT__SHIFT
+        if (d0 & mesa.A6XX_TEX_CONST_0_TILE_MODE__MASK) != 0 or (d2 & mesa.A6XX_TEX_CONST_2_TYPE__MASK) >> mesa.A6XX_TEX_CONST_2_TYPE__SHIFT != mesa.A6XX_TEX_2D or \
+           fmt not in {mesa.FMT6_32_32_32_32_FLOAT, mesa.FMT6_16_16_16_16_FLOAT}:
+            raise NotImplementedError(f"{what} descriptor {d} is not a linear 2D RGBA32F/RGBA16F image: {[hex(int(w)) for w in words[16 * d:16 * d + 6]]}")
+    return buf
 
 
 def run_asm(
@@ -1338,38 +1674,63 @@ def run_asm(
         raise NotImplementedError(f"QCOM UOp runner currently supports wave64 only, got wave_size={wave_size}")
     decoded_shader, jump_locations = _decode_program(shader)
 
-    program: dict[int, tuple[Callable, list[int], bool, Inst]] = {}
+    program: dict[int, tuple[bool, Any, bool, bool, bool, Inst, int]] = {}
 
     total_threads = math.prod(local_dims)
 
     vmem_buf = Buffer("CPU", 1<<48, options=BufferSpec(external_ptr=0)).ensure_allocated()
-    # Private-memory address rebasing is not implemented yet. Preserve the launch-provided
-    # base below, but do not allocate a private_buf that is never used by the runner.
-    has_private_memory = pvt_memsize_peritem > 0
+    pvt_bytes_per_lane = pvt_memsize_peritem * 512  # MEMSIZEPERITEM is in 512-byte units (ops_qcom: round_up(pvtmem, 512) >> 9)
+
+    n_inst = len(decoded_shader)
+    # Instructions that need the scheduler: branches, predication, barriers and the end. Everything between them is fused into runs.
+    special = [_is_cat0_branch(i) or _is_predication_enable_inst(i) or _is_predication_disable_inst(i) or _is_barrier_inst(i) or _is_end_inst(i) for i in decoded_shader]
+    leaders = {0} | {_branch_target(i.fields[-1].value, pc, jump_locations, n_inst) for pc, i in enumerate(decoded_shader) if _is_cat0_branch(i) and i.fields and _inst_name(i) != "ret"}
+    def _run_len(pc):  # a run stops before a branch target (lanes can arrive there from elsewhere) and before anything special
+        n = 1
+        while pc + n < n_inst and n < MAX_BLOCK and not special[pc + n] and (pc + n) not in leaders: n += 1
+        return n
+    blocks, pc = [], 0
+    while pc < n_inst:  # the runs the scheduler will execute, lowered up front (in parallel) when they are not cached
+        n = 1 if special[pc] else _run_len(pc)
+        if not special[pc]: blocks.append(tuple(i for inst in decoded_shader[pc:pc + n] for i in _expand_repeat(inst)))
+        pc += n
+    _precompile(blocks, mergedregs)
+    trace_regs = DEBUG >= 6  # also dump lane 0's registers after every instruction
+    stats = [0.0, 0] if os.environ.get("QCOM_EMU_STATS") else None  # [seconds inside compiled kernels, kernel calls], printed when run_asm returns
+    trace = DEBUG >= 5  # read once: ContextVar comparisons are slow in a loop that runs once per instruction
 
     def _ensure_compiled(pc):
+        # what the scheduler needs to know about an instruction, worked out once (this runs for every instruction of every wave)
         if pc not in program:
-            (prg, runtime), inst = _compile_at(pc, decoded_shader, mergedregs)
-            is_barrier = _is_barrier_inst(inst)
-            program[pc] = (runtime.fxn, prg.arg.globals, is_barrier, inst)
-            if DEBUG >= 3:
-                prev_len = _get_runner.cache_info().currsize
-                msg = f"[emu] PC={pc}: {inst!r}"
-                print(colored(msg, 'green') if _get_runner.cache_info().currsize > prev_len else msg)
+            inst = decoded_shader[pc]
+            if _is_cat0_branch(inst): program[pc] = (True, _branch_info(inst, pc, jump_locations, n_inst), False, False, False, inst, 1)
+            else:
+                n = 1 if special[pc] else _run_len(pc)
+                prev_len = _get_block_runner.cache_info().currsize
+                runner = _compile_run(pc, decoded_shader, n, mergedregs)
+                program[pc] = (False, [(runner[1].fxn, runner[0].arg.globals)] if runner is not None else [], _is_barrier_inst(inst), _is_end_inst(inst),
+                               _is_predication_enable_inst(inst) or _is_predication_disable_inst(inst), inst, n)
+                if DEBUG >= 3:
+                    msg = f"[emu] PC={pc}..{pc + n - 1}: {inst!r}"
+                    print(colored(msg, 'green') if _get_block_runner.cache_info().currsize > prev_len else msg)
         return program[pc]
 
+    shared_buf = Buffer('CPU', max(shared_memsize, 1)).ensure_allocated()
+    tex_buf, ibo_buf = _descriptor_buffer(shader_tex_constants, "texture"), _descriptor_buffer(shader_uav, "IBO")
+    pool: list[Any] = []  # the waves of a workgroup are the same objects for every workgroup, just reset: (state, buffers, kernel args, images)
+
     def _run_workgroup(group_id):
-        shared_buf = Buffer('CPU', max(shared_memsize, 1)).ensure_allocated()
         ctypes.memset(shared_buf._buf, 0, max(shared_memsize, 1))
-        waves = []
-        for wave_start in range(0, total_threads, wave_size):
-            st = _init_wave(
-                shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
-                wave_start, wave_size, total_threads, local_dims, pvt_memsize_peritem,
-                wgidconstid, wgsizeconstid, localidregid, group_id, group_dims, mergedregs
-            )
-            waves.append(
-                (st,
+        if not pool:
+            for wave_start in range(0, total_threads, wave_size):
+                st = _init_wave(
+                    shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
+                    wave_start, wave_size, total_threads, local_dims, pvt_memsize_peritem,
+                    wgidconstid, wgsizeconstid, localidregid, group_id, group_dims, mergedregs
+                )
+                pvt_buf = Buffer('CPU', max(pvt_bytes_per_lane * wave_size, 1)).ensure_allocated()
+                tmp_buf = Buffer('CPU', 4 * wave_size * 4).ensure_allocated()
+                pool.append((st,
                     [
                         ctypes.c_uint64(st.r_reg._buf),
                         ctypes.c_uint64(st.s_reg._buf),
@@ -1378,42 +1739,56 @@ def run_asm(
                         ctypes.c_uint64(st.p_reg._buf),
                         ctypes.c_uint64(vmem_buf._buf),
                         ctypes.c_uint64(shared_buf._buf),
-                        ctypes.c_uint64(pvt_mem_base if has_private_memory else 0),
-                        ctypes.c_uint64(st.exec_mask_buf._buf)
-                    ]
-                )
-            )
+                        ctypes.c_uint64(pvt_buf._buf),
+                        ctypes.c_uint64(st.exec_mask_buf._buf),
+                        ctypes.c_uint64(tmp_buf._buf),
+                        ctypes.c_uint64(tex_buf._buf),
+                        ctypes.c_uint64(ibo_buf._buf)
+                    ], {}, st.snapshot(), pvt_buf))
+        else:
+            for st, _, _, images, _ in pool: st.reset(images, wgidconstid, group_id)
+        for _, _, _, _, pvt_buf in pool: ctypes.memset(pvt_buf._buf, 0, max(pvt_bytes_per_lane * wave_size, 1))
+        waves = [(st, bufs, calls_at) for st, bufs, calls_at, _, _ in pool]
         done = [False] * len(waves)
         for _ in range(10_000_000):
             if all(done): return
             active_waves = [w for wi, w in enumerate(waves) if not done[wi]]
-            if any(st.barrier_waiting for st, _ in active_waves):
+            if any(st.barrier_waiting for st, _, _ in active_waves):
                 # A workgroup barrier is only valid when every wave still participating
                 # in the workgroup reaches it. If another wave has already ended, do not
                 # accidentally release the waiting waves as though that wave had arrived.
                 if any(done):
                     raise RuntimeError("workgroup reached a barrier after another wave had already completed")
-                if _barrier_resume_ready([st for st, _ in active_waves]):
-                    for st, _ in active_waves:
+                if _barrier_resume_ready([st for st, _, _ in active_waves]):
+                    for st, _, _ in active_waves:
                         st.barrier_waiting = False
-            for wi, (st, bufs) in enumerate(waves):
+            for wi, (st, bufs, calls_at) in enumerate(waves):
                 if done[wi] or st.barrier_waiting: continue
                 for _ in range(1_000_000):
+                    if not st.lane_mask and st.parked:  # every lane is parked: run on (as no-ops) to the next reconvergence point
+                        st.pc = min((k for k in st.parked if k >= st.pc), default=min(st.parked))
+                    if st.pc in st.parked: _unpark(st, st.pc)
                     pc = st.pc
-                    if not 0 <= pc < len(decoded_shader):
-                        raise RuntimeError(f"wave {wi} reached PC {pc} outside shader ({len(decoded_shader)} instructions)")
-                    st.pc += 1 # each instruction is 2 words
-                    inst = decoded_shader[pc]
-                    if DEBUG >= 5: print(f"  exec gid=({group_id[0]},{group_id[1]},{group_id[2]}) w={wi} PC={pc}: {inst!r}", flush=True)
-                    if _is_cat0_branch(inst):
-                        st.pc = _execute_cat0_branch(inst, st, pc, jump_locations, len(decoded_shader))
+                    if not 0 <= pc < n_inst:
+                        raise RuntimeError(f"wave {wi} reached PC {pc} outside shader ({n_inst} instructions)")
+                    is_branch, runners, is_barrier, is_end, is_pred, inst, run_len = _ensure_compiled(pc)
+                    st.pc += run_len
+                    if trace: print(f"  exec gid=({group_id[0]},{group_id[1]},{group_id[2]}) w={wi} PC={pc}: {inst!r}", flush=True)
+                    if is_branch:
+                        st.pc = _execute_cat0_branch(runners, st, pc)
                         continue
-                    fxn, globals_list, is_barrier, inst = _ensure_compiled(pc)
-                    st._exec_mask_mv[0] = st.exec_mask & 0xFFFFFFFFFFFFFFFF
-                    fxn((ctypes.c_uint64 * len(globals_list))(*[bufs[g].value for g in globals_list]))
-                    if _is_predication_enable_inst(inst) or _is_predication_disable_inst(inst):
-                        _apply_wave_predication(inst, st)
-                    if _is_end_inst(inst):
+                    if (calls:=calls_at.get(pc)) is None:  # the kernel argument arrays only depend on the wave, so build them once
+                        calls = calls_at[pc] = [(fxn, (ctypes.c_uint64 * len(gl))(*[bufs[g].value for g in gl])) for fxn, gl in runners]
+                    if stats is not None:
+                        t0 = time.perf_counter()
+                        for fxn, args in calls: fxn(args)
+                        stats[0] += time.perf_counter() - t0
+                        stats[1] += len(calls)
+                    else:
+                        for fxn, args in calls: fxn(args)
+                    if is_pred: _apply_wave_predication(inst, st)
+                    if trace_regs: print("    lane0:", _dump_lane0(st), flush=True)
+                    if is_end:
                         done[wi] = True
                         break
                     if is_barrier:
@@ -1423,5 +1798,7 @@ def run_asm(
         raise RuntimeError("exceeded 10M total scheduling rounds")
     (group_x, group_y, group_z) = group_dims
 
+    t_start = time.perf_counter()
     for gidz, gidy, gidx in itertools.product(range(group_z), range(group_y), range(group_x)):
         _run_workgroup((gidx, gidy, gidz))
+    if stats is not None: print(f"[emu stats] {group_x * group_y * group_z} workgroups: {time.perf_counter() - t_start:.3f}s total, {stats[0]:.3f}s in {stats[1]} kernel calls", flush=True)

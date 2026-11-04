@@ -40,7 +40,7 @@ class QCOMGPU(VirtGPU):
             (mesa.SB6_CS_SHADER, mesa.ST6_CONSTANTS): 16,
             (mesa.SB6_CS_SHADER, mesa.ST6_UAV): 64,
             (mesa.SB6_CS_TEX, mesa.ST6_SHADER): 16,
-            (mesa.SB6_CS_TEX, mesa.ST6_CONSTANTS): -1, #fixed size of 1600
+            (mesa.SB6_CS_TEX, mesa.ST6_CONSTANTS): 64, #one 16-dword A6XX_TEX_CONST descriptor per unit
         }
         self.cs_tex_const_size = 1600
         self.mapped_ranges = set()
