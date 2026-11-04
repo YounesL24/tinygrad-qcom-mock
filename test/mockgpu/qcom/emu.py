@@ -6,8 +6,10 @@ import hashlib
 import itertools
 import math
 import os
+import array
 import pathlib
 import re
+import struct
 import tempfile
 import time
 from typing import Any
@@ -15,9 +17,8 @@ from typing import Any
 from tinygrad.runtime.autogen import mesa
 from tinygrad.codegen import to_program
 from tinygrad.device import Buffer, BufferSpec, Device
-from tinygrad.engine.realize import get_runtime
 from tinygrad.engine.worker import get_worker_pool
-from tinygrad.helpers import DEBUG, Context, colored, diskcache_get, diskcache_put
+from tinygrad.helpers import DEBUG, Context, ceildiv, colored, diskcache_get, diskcache_put
 from tinygrad.runtime.autogen import libc
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.dtype import dtypes
@@ -30,6 +31,7 @@ NUM_S_REG = 8 * 4
 NUM_C_REG = 512 * 4
 NUM_A_REG = 2 * 1
 NUM_P_REG = 1 * 4
+def lane_stride(nlanes: int) -> int: return nlanes + 16  # words between consecutive slots of the slot-major register files
 NUM_IMG_DESC = 32  # texture / IBO descriptors visible to a shader
 
 def _c(val, dtype=dtypes.uint32): return UOp.const(val, dtype)
@@ -59,10 +61,10 @@ def _as_float16(value: UOp) -> UOp:
     return value.cast(dtypes.uint16).bitcast(dtypes.float16).cast(dtypes.float32)
 
 
-def _qcom_demoted_const_f16(ctx, token: str) -> UOp:
+def _qcom_demoted_const_f16(ctx, token: str, lane: UOp) -> UOp:
     """A half-precision float read of a constant: the 32-bit constant is converted f32 -> f16 (CONSTANT_DEMOTION_ENABLE)."""
     _, reg, dim = _qcom_reg_token(token)
-    return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int)).bitcast(dtypes.float32).cast(dtypes.float16).cast(dtypes.float32)
+    return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane).bitcast(dtypes.float32).cast(dtypes.float16).cast(dtypes.float32)
 
 
 def _qcom_float_operand(ctx, field, lane: UOp) -> UOp:
@@ -72,7 +74,7 @@ def _qcom_float_operand(ctx, field, lane: UOp) -> UOp:
         kind, _, _ = _qcom_reg_token(field.value)
     except ValueError:
         kind = ""
-    if kind == "hc": value = _qcom_demoted_const_f16(ctx, field.value)
+    if kind == "hc": value = _qcom_demoted_const_f16(ctx, field.value, lane)
     else: value = _as_float16(raw) if kind in {"hr", "hs"} else _as_float32(raw)
     return _apply_qcom_operand_modifiers(value, mods)
 
@@ -91,12 +93,13 @@ def _qcom_apply_instruction_flags(inst: "Inst", value: UOp) -> UOp:
     zero, one = UOp.const(0.0, value.dtype), UOp.const(1.0, value.dtype)
     return value.maximum(zero).minimum(one)
 
-def _thread_active(exec_mask: UOp, thread_id: UOp) -> UOp:
-  if exec_mask.dtype == dtypes.uint64: return ((exec_mask >> thread_id.cast(dtypes.uint64)) & UOp.const(1, dtypes.uint64)).ne(UOp.const(0, dtypes.uint64))
-  return ((exec_mask >> thread_id.cast(dtypes.uint32)) & _c(1)).ne(_c(0))
+def _thread_active(exec_mask: UOp, lane_in_wave: UOp) -> UOp:
+  """exec_mask is the 64-bit mask word of the hardware wave (ctx.read_exec_mask) and lane_in_wave the lane's index in it (ctx._l)."""
+  bit = lane_in_wave.cast(dtypes.uint64)
+  return ((exec_mask >> bit) & UOp.const(1, dtypes.uint64)).ne(UOp.const(0, dtypes.uint64))
 
 class _Ctx:
-    __slots__ = ("_axis_id", "wave_size", "merged", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "vmem", "shared", "pvt_mem", "tmp", "tex", "ibo", "_exec_mask", "_bufs", "fused_lane")
+    __slots__ = ("_axis_id", "wave_size", "merged", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "vmem", "shared", "pvt_mem", "tmp", "tex", "ibo", "wsbase", "_exec_mask", "_bufs", "_w", "_l", "stride")
     # The kernel's buffers, in argument order. Half registers are packed into the low/high halves of the full-width register buffer.
     r_reg: UOp
     s_reg: UOp
@@ -109,21 +112,27 @@ class _Ctx:
     tmp: UOp
     tex: UOp
     ibo: UOp
+    wsbase: UOp
     _exec_mask: UOp
 
     def __init__(self, wave_size = 64, merged = False):
+        """wave_size is the number of lanes of the (wide) wave: 64 per hardware wave. Lane L belongs to hardware wave L // 64."""
         self._axis_id = 0
         self.wave_size = wave_size
         self.merged = merged
+        waves = wave_size // 64
+        self.stride = stride = lane_stride(wave_size)
         self._bufs = {
-            "r_reg": UOp.param(0, dtypes.uint32, R_WORDS * wave_size, name="r_reg"), "s_reg": UOp.param(1, dtypes.uint32, NUM_S_REG, name="s_reg"),
-            "c_reg": UOp.param(2, dtypes.uint32, NUM_C_REG, name="c_reg"), "a_reg": UOp.param(3, dtypes.uint32, NUM_A_REG, name="a_reg"),
-            "p_reg": UOp.param(4, dtypes.uint32, NUM_P_REG * wave_size, name="p_reg"),
+            "r_reg": UOp.param(0, dtypes.uint32, R_WORDS * stride, name="r_reg"), "s_reg": UOp.param(1, dtypes.uint32, NUM_S_REG * waves, name="s_reg"),
+            "c_reg": UOp.param(2, dtypes.uint32, NUM_C_REG * waves, name="c_reg"), "a_reg": UOp.param(3, dtypes.uint32, NUM_A_REG * waves, name="a_reg"),
+            "p_reg": UOp.param(4, dtypes.uint32, NUM_P_REG * stride, name="p_reg"),
             "vmem": UOp.param(5, dtypes.uint8, 1<<48, name="vmem"),  # host VAs reach 2**47
-            "shared": UOp.param(6, dtypes.uint8, 32 * 1024, name="shared"), "pvt_mem": UOp.param(7, dtypes.uint8, 1 << 30, name="pvt_mem"),
-            "tmp": UOp.param(9, dtypes.uint32, 4 * wave_size, name="tmp")}  # scratch: swz/gat/sct park their sources here
-        self._exec_mask = UOp.param(8, dtypes.uint64, 1, name="exec_mask")
-        self.fused_lane: UOp | None = None
+            "shared": UOp.param(6, dtypes.uint8, 32 * 1024 * waves, name="shared"), "pvt_mem": UOp.param(7, dtypes.uint8, 1 << 30, name="pvt_mem"),
+            "tmp": UOp.param(9, dtypes.uint32, 4 * stride, name="tmp")}  # scratch: swz/gat/sct park their sources here
+        self._exec_mask = UOp.param(8, dtypes.uint64, waves, name="exec_mask")  # one word per hardware wave
+        self.wsbase = UOp.param(12, dtypes.uint32, waves, name="wsbase")  # byte offset of each wave's workgroup in the shared memory buffer
+        self._w: UOp | None = None  # the loops over hardware waves and over the 64 lanes of a wave (see range)
+        self._l: UOp | None = None
         self.tex = UOp.param(10, dtypes.uint32, 16 * NUM_IMG_DESC, name="tex")  # 16-dword texture / IBO descriptors (A6XX_TEX_CONST)
         self.ibo = UOp.param(11, dtypes.uint32, 16 * NUM_IMG_DESC, name="ibo")
         for name, buf in self._bufs.items(): setattr(self, name, buf)
@@ -132,106 +141,122 @@ class _Ctx:
         """Make every later access to a buffer wait for `done` (a finished instruction), so instructions can share one kernel."""
         for name, buf in self._bufs.items(): setattr(self, name, buf.after(done))
 
-    def range(self, n: int | None = None) -> UOp:
-        if self.fused_lane is not None: return self.fused_lane  # instructions fused into one lane loop share its range
-        if n is None: n = self.wave_size
-        self._axis_id += 1
-        return UOp.range(n, self._axis_id, dtype=dtypes.int)
+    def range(self) -> UOp:
+        """The lane index, as two nested loops: over the hardware waves, then over the 64 lanes of a wave. What belongs to the wave (its exec
+        mask word, its s/c/a registers) is then invariant in the inner loop, which the C compiler can vectorize."""
+        self._axis_id += 2
+        self._w = UOp.range(self.wave_size // 64, self._axis_id - 1, dtype=dtypes.int)
+        self._l = UOp.range(64, self._axis_id, dtype=dtypes.int)
+        return self._w * _c(64, dtypes.int) + self._l
 
-    def read_exec_mask(self) -> UOp:
-        return self._exec_mask.index(_c(0, dtypes.int)).load()
+    def read_exec_mask(self, thread_id: UOp) -> UOp:
+        assert self._w is not None
+        return self._exec_mask.index(self._w).load()
+
+    def lane_active(self, thread_id: UOp) -> UOp:
+        assert self._l is not None
+        return _thread_active(self.read_exec_mask(thread_id), self._l)
+
+    def wave_of(self, thread_id: UOp) -> UOp:
+        assert self._w is not None
+        return self._w
 
     def read_r_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, half=False):
         reg_slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
         if half:
-            # The half-register view is the uint16 view of the same per-lane uint32 file.
-            half_idx = thread_id.cast(dtypes.int) * _c(R_WORDS * 2, dtypes.int) + reg_slot + _c(0 if self.merged else NUM_R_REG * 2, dtypes.int)
-            word_idx = half_idx // _c(2, dtypes.int)
-            half_shift = (half_idx & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
-            word = self.r_reg.index(word_idx).load()
-            return ((word >> half_shift) & _c(0xFFFF, dtypes.uint32)).cast(dtypes.uint32)
-        idx = thread_id.cast(dtypes.int) * _c(R_WORDS, dtypes.int) + reg_slot
-        return self.r_reg.index(idx).load()
+            # Half slot h is the low (even h) or high (odd h) half of word h // 2 of the same slot-major file (merged), or of a second file
+            # behind the full registers (not merged).
+            word = self.r_reg.index(self._half_word(reg_slot, thread_id)).load()
+            return ((word >> self._half_shift(reg_slot)) & _c(0xFFFF, dtypes.uint32)).cast(dtypes.uint32)
+        return self.r_reg.index(reg_slot * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)).load()
 
-    #TODO: check all the exec masks and afters
-    #may be better to get rid of afters, there should be no ordering problems
+    def _half_word(self, half_slot: UOp, thread_id: UOp) -> UOp:
+        return _c(0 if self.merged else NUM_R_REG * self.stride, dtypes.int) + (half_slot >> _c(1, dtypes.int)) * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)
+
+    def _half_shift(self, half_slot: UOp) -> UOp:
+        return (half_slot & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
+
+    # Stores are written as unconditional read-modify-writes that keep the old value in inactive lanes: a store guarded by the exec mask is
+    # a branch the C compiler cannot vectorize across, a blend it can.
     def write_r_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, val: UOp, exec_mask: UOp, after: UOp | None = None, half=False):
         buf = self.r_reg.after(after) if after is not None else self.r_reg
         reg_slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
-        active = _thread_active(exec_mask, thread_id)
+        assert self._l is not None
+        active = _thread_active(exec_mask, self._l)
         if half:
-            half_idx = thread_id.cast(dtypes.int) * _c(R_WORDS * 2, dtypes.int) + reg_slot + _c(0 if self.merged else NUM_R_REG * 2, dtypes.int)
-            word_idx = half_idx // _c(2, dtypes.int)
-            half_shift = (half_idx & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
+            word_idx, half_shift = self._half_word(reg_slot, thread_id), self._half_shift(reg_slot)
             old = buf.index(word_idx).load()
             mask = _c(0xFFFF, dtypes.uint32) << half_shift
             merged = (old & ~mask) | ((val.cast(dtypes.uint32) & _c(0xFFFF, dtypes.uint32)) << half_shift)
-            return buf.index(word_idx.valid(active)).store(merged)
-        idx = thread_id.cast(dtypes.int) * _c(R_WORDS, dtypes.int) + reg_slot
-        return buf.index(idx.valid(active)).store(val.cast(dtypes.uint32))
+            return buf.index(word_idx).store(active.where(merged, old))
+        idx = reg_slot * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)
+        return buf.index(idx).store(active.where(val.cast(dtypes.uint32), buf.index(idx).load()))
 
-    def read_s_reg(self, reg_num: UOp, reg_dim: UOp, half=False):
+    def read_s_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, half=False):
         slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
-        idx = slot // _c(2, dtypes.int) if half else slot
+        idx = self.wave_of(thread_id) * _c(NUM_S_REG, dtypes.int) + (slot // _c(2, dtypes.int) if half else slot)
         word = self.s_reg.index(idx).load()
         if not half: return word
         shift = (slot & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
         return (word >> shift) & _c(0xFFFF, dtypes.uint32)
 
-    def write_s_reg(self, reg_num: UOp, reg_dim: UOp, val: UOp, after: UOp | None = None, half=False):
+    def write_s_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, val: UOp, after: UOp | None = None, half=False):
         buf = self.s_reg.after(after) if after is not None else self.s_reg
         slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
+        base = self.wave_of(thread_id) * _c(NUM_S_REG, dtypes.int)
         if half:
-            idx = slot // _c(2, dtypes.int)
+            idx = base + slot // _c(2, dtypes.int)
             shift = (slot & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
             mask = _c(0xFFFF, dtypes.uint32) << shift
             old = buf.index(idx).load()
             merged = (old & ~mask) | ((val.cast(dtypes.uint32) & _c(0xFFFF, dtypes.uint32)) << shift)
             return buf.index(idx).store(merged)
-        return buf.index(slot).store(val.cast(dtypes.uint32))
+        return buf.index(base + slot).store(val.cast(dtypes.uint32))
 
-    def read_c_reg(self, reg_num: UOp, reg_dim: UOp, half=False):
+    def read_c_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, half=False):
         slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
-        idx = slot // _c(2, dtypes.int) if half else slot
+        idx = self.wave_of(thread_id) * _c(NUM_C_REG, dtypes.int) + (slot // _c(2, dtypes.int) if half else slot)
         word = self.c_reg.index(idx).load()
         if not half: return word
         shift = (slot & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
         return (word >> shift) & _c(0xFFFF, dtypes.uint32)
 
-    def write_c_reg(self, reg_num: UOp, reg_dim: UOp, val: UOp, after: UOp | None = None, half=False):
+    def write_c_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, val: UOp, after: UOp | None = None, half=False):
         buf = self.c_reg.after(after) if after is not None else self.c_reg
         slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
+        base = self.wave_of(thread_id) * _c(NUM_C_REG, dtypes.int)
         if half:
-            idx = slot // _c(2, dtypes.int)
+            idx = base + slot // _c(2, dtypes.int)
             shift = (slot & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
             mask = _c(0xFFFF, dtypes.uint32) << shift
             old = buf.index(idx).load()
             merged = (old & ~mask) | ((val.cast(dtypes.uint32) & _c(0xFFFF, dtypes.uint32)) << shift)
             return buf.index(idx).store(merged)
-        return buf.index(slot).store(val.cast(dtypes.uint32))
+        return buf.index(base + slot).store(val.cast(dtypes.uint32))
 
-    def read_a_reg(self, reg_num: UOp): #TODO: make sure dim is actually unnecessary
-        return self.a_reg.index(reg_num.cast(dtypes.int)).load()
+    def read_a_reg(self, reg_num: UOp, thread_id: UOp): #TODO: make sure dim is actually unnecessary
+        return self.a_reg.index(self.wave_of(thread_id) * _c(NUM_A_REG, dtypes.int) + reg_num.cast(dtypes.int)).load()
 
-    def write_a_reg(self, reg_num: UOp, val: UOp, after: UOp | None = None):
+    def write_a_reg(self, reg_num: UOp, thread_id: UOp, val: UOp, after: UOp | None = None):
         buf = self.a_reg.after(after) if after is not None else self.a_reg
-        return buf.index(reg_num.cast(dtypes.int)).store(val.cast(dtypes.uint32))
+        return buf.index(self.wave_of(thread_id) * _c(NUM_A_REG, dtypes.int) + reg_num.cast(dtypes.int)).store(val.cast(dtypes.uint32))
 
     def read_p_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp):
         # UOp backing stores one 0/1 value per lane; WaveState packs it to a mask
         # only when the Python scheduler needs to make a wave-uniform decision.
         slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
-        idx = thread_id.cast(dtypes.int) * _c(NUM_P_REG, dtypes.int) + slot
+        idx = slot * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)
         return self.p_reg.index(idx).load()
 
     def write_p_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, val: UOp,
                     exec_mask: UOp, after: UOp | None = None):
         buf = self.p_reg.after(after) if after is not None else self.p_reg
         slot = reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
-        idx = thread_id.cast(dtypes.int) * _c(NUM_P_REG, dtypes.int) + slot
-        active = _thread_active(exec_mask, thread_id)
+        idx = slot * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)
+        assert self._l is not None
+        active = _thread_active(exec_mask, self._l)
         predicate = val.ne(_c(0, val.dtype)).cast(dtypes.uint32)
-        return buf.index(idx.valid(active)).store(predicate)
+        return buf.index(idx).store(active.where(predicate, buf.index(idx).load()))
 
     def mem_store_reg(self, mem: UOp, addr: UOp, val: UOp):
         # TODO: implement packed register stores when the emulator gets real memory semantics.
@@ -261,7 +286,7 @@ def _compile_cat0(inst, ctx):
 def _write_qcom_store(ctx: _Ctx, token: str, lane: UOp, value: UOp, after: UOp | None = None):
     kind, reg, dim = _qcom_reg_token(token)
     if kind in {"r", "hr"}:
-        exec_mask = ctx.read_exec_mask()
+        exec_mask = ctx.read_exec_mask(lane)
         if kind == "hr":
             if value.dtype == dtypes.float32: value = value.cast(dtypes.float16).bitcast(dtypes.uint16)
             elif value.dtype == dtypes.float16: value = value.bitcast(dtypes.uint16)
@@ -275,17 +300,17 @@ def _write_qcom_store(ctx: _Ctx, token: str, lane: UOp, value: UOp, after: UOp |
             if value.dtype == dtypes.float32: value = value.cast(dtypes.float16).bitcast(dtypes.uint16)
             elif value.dtype == dtypes.float16: value = value.bitcast(dtypes.uint16)
             else: value = value.cast(dtypes.uint16)
-        return ctx.write_s_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), _as_reg_bits(value), after=after, half=(kind == "hs"))
+        return ctx.write_s_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, _as_reg_bits(value), after=after, half=(kind == "hs"))
     if kind in {"c", "hc"}:
         if kind == "hc":
             if value.dtype == dtypes.float32: value = value.cast(dtypes.float16).bitcast(dtypes.uint16)
             elif value.dtype == dtypes.float16: value = value.bitcast(dtypes.uint16)
             else: value = value.cast(dtypes.uint16)
-        return ctx.write_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), _as_reg_bits(value), after=after, half=(kind == "hc"))
+        return ctx.write_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, _as_reg_bits(value), after=after, half=(kind == "hc"))
     if kind == "a":
-        return ctx.write_a_reg(_c(reg, dtypes.int), _as_reg_bits(value), after=after)
+        return ctx.write_a_reg(_c(reg, dtypes.int), lane, _as_reg_bits(value), after=after)
     if kind == "p":
-        exec_mask = ctx.read_exec_mask()
+        exec_mask = ctx.read_exec_mask(lane)
         return ctx.write_p_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, value, exec_mask, after=after)
     raise ValueError(f"Unsupported QCOM register kind {kind!r} in {token!r}")
 
@@ -377,12 +402,12 @@ def _compile_cat1(inst, ctx):
         # These move in parallel (swz can swap two registers), so every source is read before any destination is written. Within one
         # kernel loop the scheduler is free to move a load past a store to the same word (two half registers share one), so the sources are
         # parked in a scratch buffer by a first loop and written out by a second one. (_end_lane_range closes the first loop.)
-        parked = _end_lane_range(UOp.sink(*[ctx.tmp.index(lane * _c(4, dtypes.int) + _c(i, dtypes.int)).store(_as_reg_bits(v)) for i, v in enumerate(vals)]))
+        parked = _end_lane_range(UOp.sink(*[ctx.tmp.index(_c(i * ctx.stride, dtypes.int) + lane).store(_as_reg_bits(v)) for i, v in enumerate(vals)]))
         ctx.advance(parked)
         lane = ctx.range()
         stores: list[UOp] = []
         for i, dst in enumerate(targets):  # chained: half destinations share words, so the read-modify-write stores must not overlap
-            stores.append(_write_qcom_store(ctx, dst, lane, ctx.tmp.index(lane * _c(4, dtypes.int) + _c(i, dtypes.int)).load(), after=stores[-1] if stores else None))
+            stores.append(_write_qcom_store(ctx, dst, lane, ctx.tmp.index(_c(i * ctx.stride, dtypes.int) + lane).load(), after=stores[-1] if stores else None))
         return UOp.sink(*stores)
 
     if len(inst.fields) < 3: raise RuntimeError(f"Category 1 instruction is missing operands: {inst!r}")
@@ -441,12 +466,12 @@ def _qcom_read_value(ctx: _Ctx, token: str, lane: UOp) -> UOp:
     kind, reg, dim = _qcom_reg_token(token)
     if kind == "r": return ctx.read_r_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
     if kind == "hr": return ctx.read_r_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, half=True)
-    if kind in {"s", "hs"}: return ctx.read_s_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), half=(kind == "hs"))
-    if kind == "c": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int))
+    if kind in {"s", "hs"}: return ctx.read_s_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, half=(kind == "hs"))
+    if kind == "c": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
     # CONSTANT_DEMOTION_ENABLE (set by ops_qcom for IR3): hcN.c is the full 32-bit constant cN.c, demoted for the half-precision reader.
     # Integer readers see the low 16 bits (u2u16, done here); float readers convert f32->f16 (_qcom_demoted_const_f16). ir3_cp.c.
-    if kind == "hc": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int)) & _c(0xFFFF, dtypes.uint32)
-    if kind == "a": return ctx.read_a_reg(_c(reg, dtypes.int))
+    if kind == "hc": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane) & _c(0xFFFF, dtypes.uint32)
+    if kind == "a": return ctx.read_a_reg(_c(reg, dtypes.int), lane)
     if kind == "p": return ctx.read_p_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
     raise ValueError(f"Unsupported QCOM register kind {kind!r} in {token!r}")
 
@@ -490,7 +515,7 @@ def _qcom_read_operand(ctx: _Ctx, token: str, lane: UOp, modifiers: list[str] | 
 def _qcom_read_typed_operand(ctx: _Ctx, field, lane: UOp, typ: str) -> UOp:
     raw, mods = _qcom_read_raw_operand(ctx, field.value, lane, field.modifiers)
     if typ == "f16" and _QCOM_REG_RE.fullmatch(field.value.strip()) and _qcom_reg_token(field.value)[0] == "hc":
-        return _apply_qcom_operand_modifiers(_qcom_demoted_const_f16(ctx, field.value), mods)
+        return _apply_qcom_operand_modifiers(_qcom_demoted_const_f16(ctx, field.value, lane), mods)
     # signed integer ALU ops on half registers / h(imm) sources work on 16-bit values: sign-extend from bit 15, not from bit 31
     if typ == "s32" and field.value.strip().lower().startswith("h"): return _apply_qcom_operand_modifiers(_qcom_decode_typed(raw, "s16").cast(dtypes.int32), mods)
     return _apply_qcom_operand_modifiers(_qcom_decode_typed(raw, typ), mods)
@@ -674,12 +699,13 @@ def _mem_byte_index(ctx: _Ctx, mem_kind: str, addr_i: UOp, i: int, lane: UOp) ->
     wave and interleaves it by dword across the lanes (lane l's dword d lives at d*wave_size*4 + l*4), so every lane sees its own
     p[...] space. The GPU VA in SP_CS_PVT_MEM_BASE is never read by shaders, so it does not need to be honoured."""
     b = addr_i + _c(i, dtypes.int64)
+    if mem_kind == "l": return b + ctx.wsbase.index(ctx.wave_of(lane)).load().cast(dtypes.int64)
     if mem_kind != "p": return b
     return (b >> _c(2, dtypes.int64)) * _c(ctx.wave_size * 4, dtypes.int64) + lane.cast(dtypes.int64) * _c(4, dtypes.int64) + (b & _c(3, dtypes.int64))
 
 def _load_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, suffix: str, lane: UOp) -> UOp:
     mem = {"g": ctx.vmem, "l": ctx.shared, "p": ctx.pvt_mem}[mem_kind]
-    active = _thread_active(ctx.read_exec_mask(), lane)
+    active = ctx.lane_active(lane)
     dtype = _qcom_mem_dtype(suffix)
     nbytes = dtype.itemsize
     raw_dtype = {1: dtypes.uint8, 2: dtypes.uint16, 4: dtypes.uint32, 8: dtypes.uint64}[nbytes]
@@ -702,7 +728,7 @@ def _load_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, suffix: str, lane: UOp)
 
 def _store_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, value: UOp, suffix: str, lane: UOp):
     mem = {"g": ctx.vmem, "l": ctx.shared, "p": ctx.pvt_mem}[mem_kind]
-    active = _thread_active(ctx.read_exec_mask(), lane)
+    active = ctx.lane_active(lane)
     dtype = _qcom_mem_dtype(suffix)
     nbytes = dtype.itemsize
     raw_dtype = {1: dtypes.uint8, 2: dtypes.uint16, 4: dtypes.uint32, 8: dtypes.uint64}[nbytes]
@@ -838,7 +864,7 @@ def _texel_addr(desc: dict, x: UOp, y: UOp) -> tuple[UOp, UOp, UOp]:
 def _load_texel(ctx, desc: dict, x: UOp, y: UOp, lane: UOp, swizzle: bool) -> list[UOp]:
     """The four float32 components of texel (x, y); zero outside the image (CLAMP_TO_BORDER with a transparent-black border)."""
     addr, inb, is32 = _texel_addr(desc, x, y)
-    valid = inb & _thread_active(ctx.read_exec_mask(), lane)
+    valid = inb & ctx.lane_active(lane)
     comps = []
     for i in range(4):
         raw: UOp | None = None
@@ -862,7 +888,7 @@ def _load_texel(ctx, desc: dict, x: UOp, y: UOp, lane: UOp, swizzle: bool) -> li
 def _store_texel(ctx, desc: dict, x: UOp, y: UOp, values: list[UOp], lane: UOp) -> list[UOp]:
     """Write four float32 values as texel (x, y); out of bounds writes are dropped."""
     addr, inb, is32 = _texel_addr(desc, x, y)
-    valid = inb & _thread_active(ctx.read_exec_mask(), lane)
+    valid = inb & ctx.lane_active(lane)
     stores = []
     for j in range(16):
         f32_byte = (values[j // 4].bitcast(dtypes.uint32) >> _c(8 * (j % 4), dtypes.uint32)) & _c(0xFF, dtypes.uint32)
@@ -1070,7 +1096,7 @@ def _compile_inst(inst, ctx):
 def _end_lane_range(sink):
     # every compile function builds its per-lane work inside one ctx.range(); close it here (like the AMD emulator's .end(lane))
     rngs = list(sink.ranges)  # the still-open ranges: earlier instructions of a fused block are already ended
-    assert len(rngs) <= 1, f"expected at most one lane range, got {len(rngs)}"
+    assert len(rngs) in {0, 2}, f"expected the wave and lane loops of one instruction, got {len(rngs)} ranges"
     return UOp.sink(sink.end(*rngs)) if rngs else sink
 
 # Lowering a run of instructions to a CPU kernel costs tens of ms per instruction in graph rewrites and a real kernel has hundreds of
@@ -1081,251 +1107,218 @@ _EMU_SRC_HASH = hashlib.sha256(_src[_src.index("NUM_R_REG"):_src.index("class Wa
 
 MAX_BLOCK = int(os.environ.get("QCOM_EMU_MAX_BLOCK", "48"))  # longest run of instructions fused into one kernel (compile time grows faster than linearly past this)
 
-def _block_key(insts: tuple, merged: bool) -> dict:
-    return {"emu": _EMU_SRC_HASH, "insts": hashlib.sha256(repr(insts).encode()).hexdigest(), "merged": int(merged)}
+def _block_key(insts: tuple, merged: bool, nlanes: int) -> dict:
+    return {"emu": _EMU_SRC_HASH, "insts": hashlib.sha256(repr(insts).encode()).hexdigest(), "merged": int(merged), "nlanes": nlanes}
 
-def _is_lane_local(inst: "Inst") -> bool:
-    """ALU-style instructions only touch their own lane's registers, so a run of them can share one loop over the lanes."""
-    return inst.cat in {1, 2, 3, 4} and not _inst_name(inst).startswith(("swz", "gat", "sct", "mova", "movs", "movmsk"))
-
-
-def _lower_block(insts: tuple, merged: bool, renderer=None):
+def _lower_block(insts: tuple, merged: bool, nlanes: int, renderer=None):
     """Lower a straight-line run of instructions (each (rptN) already expanded) to one CPU program; False if there is no work."""
     with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
-        ctx = _Ctx(merged=merged)
+        ctx = _Ctx(nlanes, merged)
         sinks: list[UOp] = []
-        group: list[UOp] = []  # consecutive lane-local instructions share one loop over the lanes (the values stay in registers in between)
-
-        def flush():
-            if not group: return
-            sinks.append(sink:=_end_lane_range(UOp.sink(*group)))
-            ctx.advance(sink)
-            group.clear()
-            ctx.fused_lane = None
         for inst in insts:
-            if _is_lane_local(inst):
-                if ctx.fused_lane is None: ctx.fused_lane = ctx.range()  # the first instruction of a group opens the loop
-                sink = _compile_inst(inst, ctx)
-                if sink.op is Ops.SINK and not sink.src: continue
-                group.append(sink)
-                ctx.advance(sink)  # later instructions of the loop read what this one wrote (same lane, so only ordering is needed)
-            else:
-                flush()
-                ctx.fused_lane = None
-                sink = _end_lane_range(_compile_inst(inst, ctx))
-                if sink.op is Ops.SINK and not sink.src: continue  # nop-like: nothing to run
-                sinks.append(sink)
-                ctx.advance(sink)
-        flush()
+            sink = _end_lane_range(_compile_inst(inst, ctx))
+            if sink.op is Ops.SINK and not sink.src: continue  # nop-like: nothing to run
+            sinks.append(sink)
+            ctx.advance(sink)
         if not sinks: return False
-        return to_program(UOp.sink(*sinks).replace(arg=KernelInfo(name=f"qcom_{_inst_name(insts[0])}_x{len(insts)}")), renderer or Device['CPU'].renderer)
+        prg = to_program(UOp.sink(*sinks).replace(arg=KernelInfo(name=f"qcom_{_inst_name(insts[0])}_x{len(insts)}")), renderer or Device['CPU'].renderer)
+        return prg.to_elf(), list(prg.arg.globals)  # the loadable binary and the order of the buffers it takes (cheap to store and load)
 
 _lower_block_task = lambda args: (args[0], _lower_block(*args[1:]))  # noqa: E731  (pool task: worker processes cannot open devices, so the renderer is passed in)
 
-_PROGRAMS: dict[tuple[str, bool], Any] = {}  # lowered programs seen by this process, by key
+_PROGRAMS: dict[tuple[str, bool, int], Any] = {}  # lowered programs seen by this process, by key
 
-def _load_program(insts: tuple, merged: bool, lower: bool = True):
-    key = _block_key(insts, merged)
-    if (prg:=_PROGRAMS.get((key["insts"], merged))) is None and (prg:=diskcache_get("qcom_emu_block", key)) is None and lower:
-        prg = diskcache_put("qcom_emu_block", key, _lower_block(insts, merged))
-    if prg is not None: _PROGRAMS[(key["insts"], merged)] = prg
+def _load_program(insts: tuple, merged: bool, nlanes: int, lower: bool = True):
+    key = _block_key(insts, merged, nlanes)
+    if (prg:=_PROGRAMS.get((key["insts"], merged, nlanes))) is None and (prg:=diskcache_get("qcom_emu_elf", key)) is None and lower:
+        prg = diskcache_put("qcom_emu_elf", key, _lower_block(insts, merged, nlanes))
+    if prg is not None: _PROGRAMS[(key["insts"], merged, nlanes)] = prg
     return prg
 
 @functools.cache
-def _get_block_runner(insts: tuple, merged=False):
+def _get_block_runner(insts: tuple, merged: bool, nlanes: int):
     """The runnable kernel for a straight-line run of instructions, or None if the run has no work."""
-    prg = _load_program(insts, merged)
-    with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
-        return (prg, get_runtime('CPU', prg)) if prg is not False else None
+    prg = _load_program(insts, merged, nlanes)
+    return (prg[1], Device['CPU'].runtime(prg[0])) if prg is not False else None
 
-def _precompile(blocks: list[tuple], merged: bool) -> None:
+def _precompile(blocks: list[tuple], merged: bool, nlanes: int) -> None:
     """Lower every block of a shader that is not cached yet, in tinygrad's worker pool (a cold shader has hundreds)."""
-    todo = {k["insts"]: b for b in blocks if _load_program(b, merged, lower=False) is None and (k:=_block_key(b, merged))}
+    todo = {k["insts"]: b for b in blocks if _load_program(b, merged, nlanes, lower=False) is None and (k:=_block_key(b, merged, nlanes))}
     if len(todo) < 6 or (pool:=get_worker_pool()) is None: return  # not worth the round trips / no workers: compiled when first run
     renderer, keys = Device['CPU'].renderer, list(todo)
     try:
-        for i, prg in pool.imap_unordered(_lower_block_task, [(i, todo[k], merged, renderer) for i, k in enumerate(keys)]):
-            diskcache_put("qcom_emu_block", _block_key(todo[keys[i]], merged), prg)
-            _PROGRAMS[(keys[i], merged)] = prg
+        for i, prg in pool.imap_unordered(_lower_block_task, [(i, todo[k], merged, nlanes, renderer) for i, k in enumerate(keys)]):
+            diskcache_put("qcom_emu_elf", _block_key(todo[keys[i]], merged, nlanes), prg)
+            _PROGRAMS[(keys[i], merged, nlanes)] = prg
     except Exception: pass  # an unsupported instruction: it is reported with its name if the block is ever run
 
-def _compile_run(pc, decoded_shader, n, merged=False):
+def _compile_run(pc, decoded_shader, n, merged, nlanes):
     """Compile instructions [pc, pc+n) as one kernel; the error names the instruction that failed."""
     insts = tuple(i for inst in decoded_shader[pc:pc+n] for i in _expand_repeat(inst))
-    try: return _get_block_runner(insts, merged)
+    try: return _get_block_runner(insts, merged, nlanes)
     except Exception:
         for inst in insts:  # find the culprit for the message
-            try: _end_lane_range(_compile_inst(inst, _Ctx(merged=merged)))
+            try: _end_lane_range(_compile_inst(inst, _Ctx(nlanes, merged)))
             except Exception as e: raise RuntimeError(f"[emu] Failed to compile {inst!r}: {type(e).__name__}: {e}") from e
         raise
 
 
 class WaveState:
-    __slots__ = ("wave_size", "wave_idx", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "_r_reg_mv", "_s_reg_mv", "_c_reg_mv", "_hr_reg_mv", "_hs_reg_mv", "_hc_reg_mv", "_a_reg_mv", "_p_reg_mv", "pc", "exec_mask", "exec_mask_buf", "_exec_mask_mv", "lane_mask", "predication_mask", "predication_mode", "barrier_waiting", "call_stack", "mergedregs", "parked", "launch_mask")
+    """Up to 16 hardware waves run as one wide wave of `wave_size` = 64 * n_waves lanes, so that one kernel call advances all of them.
+    Whole workgroups are packed side by side (workgroup g owns waves g*wpg .. (g+1)*wpg-1); lane L belongs to wave L // 64. Registers that
+    a hardware wave shares (s, c, a) are kept per wave, lanes diverge and reconverge through `parked` like they do within a wave."""
+    __slots__ = ("wave_size", "stride", "n_waves", "waves_per_group", "group_masks", "r_reg", "s_reg", "c_reg", "a_reg", "p_reg", "_r_reg_mv", "_s_reg_mv", "_c_reg_mv", "_hr_reg_mv",
+                 "_hs_reg_mv", "_hc_reg_mv", "_a_reg_mv", "_p_reg_mv", "pc", "exec_mask", "exec_mask_buf", "lane_mask", "predication_mask", "predication_mode",
+                 "call_stack", "mergedregs", "parked", "launch_mask")
 
-    def __init__(
-        self, wave_size, wave_idx,
-        shader_constants, wgidconstid, wgsizeconstid, localidregid,
-        wgid, wgsize, local_dims, mergedregs=False
-    ):
+    def __init__(self, wave_size, shader_constants, wgidconstid, wgsizeconstid, localidregid, wgids, wgsize, local_dims, mergedregs=False):
         self.wave_size = wave_size
+        self.n_waves = n_waves = wave_size // 64
         self.mergedregs = mergedregs
-        self.wave_idx = wave_idx
-        active_lanes = min(wave_size, max(0, math.prod(local_dims) - wave_idx * wave_size))
-        self.launch_mask = (1 << active_lanes) - 1
-        self.lane_mask = (1 << active_lanes) - 1  # lanes currently running; lanes waiting at a reconvergence point are removed (see parked)
+        threads = math.prod(local_dims)
+        self.waves_per_group = wpg = ceildiv(threads, 64)
+        assert n_waves % wpg == 0 and len(wgids) <= n_waves // wpg
+        # lanes that exist in each workgroup slot (the last wave of a workgroup may be partial)
+        self.group_masks = [sum(((1 << min(64, max(0, threads - k * 64))) - 1) << (64 * (g * wpg + k)) for k in range(wpg)) for g in range(n_waves // wpg)]
+        self.launch_mask = functools.reduce(lambda a, b: a | b, self.group_masks[:len(wgids)], 0)
+        self.lane_mask = self.launch_mask  # lanes currently running; lanes waiting at a reconvergence point are removed (see parked)
         self.parked: dict[int, int] = {}  # pc -> lanes parked there by a divergent branch, rejoined when the wave reaches that pc
         self.exec_mask = self.lane_mask
-        self.exec_mask_buf = Buffer('CPU', 8).ensure_allocated()
-        self._exec_mask_mv = self.exec_mask_buf.host.view(fmt='Q').mv
-        self._exec_mask_mv[0] = self.exec_mask
+        self.exec_mask_buf = Buffer('CPU', 8 * n_waves).ensure_allocated()
+        self._push_exec_mask()
         self.predication_mask = 0
         self.predication_mode = "none"
-        self.barrier_waiting = False
         self.call_stack: list[int] = []
 
         #r0 - r47
-        self.r_reg = Buffer('CPU', R_WORDS * self.wave_size * 4)
+        self.stride = lane_stride(wave_size)
+        self.r_reg = Buffer('CPU', R_WORDS * self.stride * 4)
         self._r_reg_mv = self.r_reg.host.view(fmt='I').mv
         self._hr_reg_mv = self.r_reg.host.view(fmt='H').mv
-        #shared across threads
+        #shared across the threads of a hardware wave
         #r48 - r55
-        self.s_reg = Buffer('CPU', NUM_S_REG * 4)
+        self.s_reg = Buffer('CPU', NUM_S_REG * 4 * n_waves)
         self._s_reg_mv = self.s_reg.host.view(fmt='I').mv
         self._hs_reg_mv = self.s_reg.host.view(fmt='H').mv
 
-        self.c_reg = Buffer('CPU', NUM_C_REG * 4)
+        self.c_reg = Buffer('CPU', NUM_C_REG * 4 * n_waves)
         self._c_reg_mv = self.c_reg.host.view(fmt='I').mv
         self._hc_reg_mv = self.c_reg.host.view(fmt='H').mv
 
-        self.a_reg = Buffer('CPU', NUM_A_REG * 4)
+        self.a_reg = Buffer('CPU', NUM_A_REG * 4 * n_waves)
         self._a_reg_mv = self.a_reg.host.view(fmt='I').mv
         # Back p0.x/y/z/w with a 0/1 word per lane. This makes predicate destinations
         # straightforward to compile as vector UOps; _read_p_reg packs them for control flow.
-        self.p_reg = Buffer('CPU', NUM_P_REG * self.wave_size * 4)
+        self.p_reg = Buffer('CPU', NUM_P_REG * self.stride * 4)
         self._p_reg_mv = self.p_reg.host.view(fmt='I').mv
 
-        ctypes.memset(self.r_reg._buf, 0, R_WORDS * self.wave_size * 4)
-        ctypes.memset(self.s_reg._buf, 0, NUM_S_REG * 4)
-        ctypes.memset(self.c_reg._buf, 0, NUM_C_REG * 4)
-        ctypes.memset(self.a_reg._buf, 0, NUM_A_REG * 4)
-        ctypes.memset(self.p_reg._buf, 0, NUM_P_REG * wave_size * 4)
+        ctypes.memset(self.r_reg._buf, 0, R_WORDS * self.stride * 4)
+        ctypes.memset(self.s_reg._buf, 0, NUM_S_REG * 4 * n_waves)
+        ctypes.memset(self.c_reg._buf, 0, NUM_C_REG * 4 * n_waves)
+        ctypes.memset(self.a_reg._buf, 0, NUM_A_REG * 4 * n_waves)
+        ctypes.memset(self.p_reg._buf, 0, NUM_P_REG * self.stride * 4)
 
         self.pc = 0
 
-        # LOAD_STATE6 constants are supplied as 32-bit words; populate cN.{x,y,z,w}.
-        # System values are written afterwards so their designated slots take precedence.
-        for i, val in enumerate(shader_constants[:NUM_C_REG]):
-            self._write_c_reg(i // 4, i % 4, int(val))
-
-        # Each *regid is (register << 2 | first component) with 0xFC meaning "unused" (Mesa INVALID_REG); a vec3 occupies
-        # three consecutive components, which may start mid-register (ir3_find_sysval_regid / create_sysval_input mask 0x7).
-        # (tinygrad's shaders read the workgroup id from r48.x/y/z, i.e. the shared file, so a register id >= 48 lands there)
-        self._write_wgid(wgidconstid, wgid)
-        if wgsizeconstid != 0xFC:
-            for i in range(3):
-                self._write_c_reg((wgsizeconstid + i) >> 2, (wgsizeconstid + i) & 3, wgsize[i])
-
-        active_lanes = min(self.wave_size, max(0, math.prod(local_dims) - wave_idx * self.wave_size))
-        if localidregid != 0xFC:
-            for i in range(active_lanes):
-                global_pos = i + wave_idx * wave_size
-                local_x = global_pos % local_dims[0]
-                local_y = (global_pos // local_dims[0]) % local_dims[1]
-                local_z = global_pos // (local_dims[0] * local_dims[1])
-                localid = (local_x, local_y, local_z)
-                for j in range(3):
-                    self._write_r_reg(i, (localidregid + j) >> 2, (localidregid + j) & 3, localid[j])
+        consts = [int(v) & 0xFFFFFFFF for v in shader_constants[:NUM_C_REG]]
+        c_image = struct.pack(f"{len(consts)}I", *consts)
+        for w in range(n_waves):
+            # LOAD_STATE6 constants are supplied as 32-bit words; populate cN.{x,y,z,w}.
+            # System values are written afterwards so their designated slots take precedence.
+            ctypes.memmove(self.c_reg._buf + w * NUM_C_REG * 4, c_image, len(c_image))
+            # Each *regid is (register << 2 | first component) with 0xFC meaning "unused" (Mesa INVALID_REG); a vec3 occupies
+            # three consecutive components, which may start mid-register (ir3_find_sysval_regid / create_sysval_input mask 0x7).
+            if wgsizeconstid != 0xFC:
+                for i in range(3):
+                    self._write_c_reg((wgsizeconstid + i) >> 2, (wgsizeconstid + i) & 3, wgsize[i], wave=w)
+            if localidregid != 0xFC and w // wpg < len(wgids):
+                positions = range((w % wpg) * 64, (w % wpg) * 64 + min(64, max(0, threads - (w % wpg) * 64)))
+                for j, ids in enumerate(([p % local_dims[0] for p in positions], [(p // local_dims[0]) % local_dims[1] for p in positions],
+                                         [p // (local_dims[0] * local_dims[1]) for p in positions])):
+                    slot = ((localidregid + j) >> 2) * 4 + ((localidregid + j) & 3)
+                    self._r_reg_mv[slot * self.stride + w * 64:slot * self.stride + w * 64 + len(ids)] = array.array("I", ids)
+        for g, wgid in enumerate(wgids): self._write_wgid(wgidconstid, wgid, g)
         #wgoffset and linearlocalid not exposed
+
+    def _push_exec_mask(self):
+        ctypes.memmove(self.exec_mask_buf._buf, (self.exec_mask & ((1 << self.wave_size) - 1)).to_bytes(8 * self.n_waves, "little"), 8 * self.n_waves)
 
     def _decode_reg(self, reg_id):
         return reg_id >> 2, reg_id & 3
 
     def _write_r_reg(self, thread_id, reg_num, reg_dim, val, half=False):
         if half:
-            self._hr_reg_mv[thread_id * R_WORDS * 2 + (0 if self.mergedregs else NUM_R_REG * 2) + reg_num * 4 + reg_dim] = val
+            self._hr_reg_mv[self._half_index(thread_id, reg_num, reg_dim)] = val
         else:
-            self._r_reg_mv[thread_id * R_WORDS + reg_num * 4 + reg_dim] = val
+            self._r_reg_mv[(reg_num * 4 + reg_dim) * self.stride + thread_id] = val
     def _read_r_reg(self, thread_id, reg_num, reg_dim, half=False):
         if half:
-            return self._hr_reg_mv[thread_id * R_WORDS * 2 + (0 if self.mergedregs else NUM_R_REG * 2) + reg_num * 4 + reg_dim]
+            return self._hr_reg_mv[self._half_index(thread_id, reg_num, reg_dim)]
         else:
-            return self._r_reg_mv[thread_id * R_WORDS + reg_num * 4 + reg_dim]
-    def _write_s_reg(self, reg_num, reg_dim, val, half=False):
+            return self._r_reg_mv[(reg_num * 4 + reg_dim) * self.stride + thread_id]
+    def _half_index(self, thread_id, reg_num, reg_dim):  # index into the uint16 view of the register file
+        h = reg_num * 4 + reg_dim
+        return ((0 if self.mergedregs else NUM_R_REG * self.stride) + (h >> 1) * self.stride + thread_id) * 2 + (h & 1)
+    def _write_s_reg(self, reg_num, reg_dim, val, half=False, wave=0):
         if half:
-            self._hs_reg_mv[reg_num * 4 + reg_dim] = val
+            self._hs_reg_mv[wave * NUM_S_REG * 2 + reg_num * 4 + reg_dim] = val
         else:
-            self._s_reg_mv[reg_num * 4 + reg_dim] = val
-    def _read_s_reg(self, reg_num, reg_dim, half=False):
+            self._s_reg_mv[wave * NUM_S_REG + reg_num * 4 + reg_dim] = val
+    def _read_s_reg(self, reg_num, reg_dim, half=False, wave=0):
         if half:
-            return self._hs_reg_mv[reg_num * 4 + reg_dim]
+            return self._hs_reg_mv[wave * NUM_S_REG * 2 + reg_num * 4 + reg_dim]
         else:
-            return self._s_reg_mv[reg_num * 4 + reg_dim]
+            return self._s_reg_mv[wave * NUM_S_REG + reg_num * 4 + reg_dim]
     #only during initialisation (const registers)
-    def _write_c_reg(self, reg_num, reg_dim, val, half=False):
+    def _write_c_reg(self, reg_num, reg_dim, val, half=False, wave=0):
         if half:
-            self._hc_reg_mv[reg_num * 4 + reg_dim] = val
+            self._hc_reg_mv[wave * NUM_C_REG * 2 + reg_num * 4 + reg_dim] = val
         else:
-            self._c_reg_mv[reg_num * 4 + reg_dim] = val
-    def _read_c_reg(self, reg_num, reg_dim, half=False):
+            self._c_reg_mv[wave * NUM_C_REG + reg_num * 4 + reg_dim] = val
+    def _read_c_reg(self, reg_num, reg_dim, half=False, wave=0):
         if half:
-            return self._hc_reg_mv[reg_num * 4 + reg_dim]
+            return self._hc_reg_mv[wave * NUM_C_REG * 2 + reg_num * 4 + reg_dim]
         else:
-            return self._c_reg_mv[reg_num * 4 + reg_dim]
-    def _write_a_reg(self, reg_num, val):
-        self._a_reg_mv[reg_num] = val
-    def _read_a_reg(self, reg_num):
-        return self._a_reg_mv[reg_num]
+            return self._c_reg_mv[wave * NUM_C_REG + reg_num * 4 + reg_dim]
+    def _write_a_reg(self, reg_num, val, wave=0):
+        self._a_reg_mv[wave * NUM_A_REG + reg_num] = val
+    def _read_a_reg(self, reg_num, wave=0):
+        return self._a_reg_mv[wave * NUM_A_REG + reg_num]
     def _write_p_reg(self, reg_num, reg_dim, val):
         # Scalar helper used by setup/low-level code: write mask bits to per-lane booleans.
         for lane in range(self.wave_size):
-            self._p_reg_mv[lane * NUM_P_REG + reg_num * 4 + reg_dim] = (val >> lane) & 1
+            self._p_reg_mv[(reg_num * 4 + reg_dim) * self.stride + lane] = (val >> lane) & 1
     def _read_p_reg(self, reg_num, reg_dim):
-        # one 0/1 word per lane, NUM_P_REG words apart: take that word's low byte for every lane and read the bytes as binary digits
-        raw = ctypes.string_at(self.p_reg._buf, self.wave_size * NUM_P_REG * 4)
-        return int(raw[(reg_num * 4 + reg_dim) * 4::NUM_P_REG * 4].translate(_BIT_DIGITS)[::-1], 2)
+        # one 0/1 word per lane, contiguous for a component: take each word's low byte and read the bytes as binary digits
+        raw = ctypes.string_at(self.p_reg._buf + (reg_num * 4 + reg_dim) * self.stride * 4, self.wave_size * 4)
+        return int(raw[::4].translate(_BIT_DIGITS)[::-1], 2)
 
-    def _write_wgid(self, wgidconstid, wgid):
+    def _write_wgid(self, wgidconstid, wgid, group):
         # (tinygrad's shaders read the workgroup id from r48.x/y/z, i.e. the shared file, so a register id >= 48 lands there)
         if wgidconstid == 0xFC: return
-        for i in range(3):
-            reg = (wgidconstid + i) >> 2
-            if reg >= 48: self._write_s_reg(reg - 48, (wgidconstid + i) & 3, wgid[i])
-            else: self._write_c_reg(reg, (wgidconstid + i) & 3, wgid[i])
+        for w in range(group * self.waves_per_group, (group + 1) * self.waves_per_group):
+            for i in range(3):
+                reg = (wgidconstid + i) >> 2
+                if reg >= 48: self._write_s_reg(reg - 48, (wgidconstid + i) & 3, wgid[i], wave=w)
+                else: self._write_c_reg(reg, (wgidconstid + i) & 3, wgid[i], wave=w)
 
     def snapshot(self) -> tuple[bytes, bytes, bytes]:
-        """The register images a fresh wave starts from (everything but the workgroup id is the same for every workgroup)."""
-        return (ctypes.string_at(self.r_reg._buf, R_WORDS * self.wave_size * 4), ctypes.string_at(self.c_reg._buf, NUM_C_REG * 4),
-                ctypes.string_at(self.s_reg._buf, NUM_S_REG * 4))
+        """The register images a fresh batch starts from (everything but the workgroup ids is the same for every batch)."""
+        return (ctypes.string_at(self.r_reg._buf, R_WORDS * self.stride * 4), ctypes.string_at(self.c_reg._buf, NUM_C_REG * 4 * self.n_waves),
+                ctypes.string_at(self.s_reg._buf, NUM_S_REG * 4 * self.n_waves))
 
-    def reset(self, images: tuple[bytes, bytes, bytes], wgidconstid, wgid) -> None:
-        """Return to the state at the start of a workgroup without reallocating anything."""
+    def reset(self, images: tuple[bytes, bytes, bytes], wgidconstid, wgids) -> None:
+        """Return to the state at the start of a batch of workgroups without reallocating anything."""
         for buf, img in zip((self.r_reg, self.c_reg, self.s_reg), images): ctypes.memmove(buf._buf, img, len(img))
-        ctypes.memset(self.a_reg._buf, 0, NUM_A_REG * 4)
-        ctypes.memset(self.p_reg._buf, 0, NUM_P_REG * self.wave_size * 4)
-        self._write_wgid(wgidconstid, wgid)
+        ctypes.memset(self.a_reg._buf, 0, NUM_A_REG * 4 * self.n_waves)
+        ctypes.memset(self.p_reg._buf, 0, NUM_P_REG * self.stride * 4)
+        for g, wgid in enumerate(wgids): self._write_wgid(wgidconstid, wgid, g)
+        self.launch_mask = functools.reduce(lambda a, b: a | b, self.group_masks[:len(wgids)], 0)
         self.lane_mask = self.exec_mask = self.launch_mask
-        self._exec_mask_mv[0] = self.exec_mask
+        self._push_exec_mask()
         self.parked = {}
-        self.predication_mask, self.predication_mode, self.barrier_waiting, self.call_stack, self.pc = 0, "none", False, [], 0
+        self.predication_mask, self.predication_mode, self.call_stack, self.pc = 0, "none", [], 0
 
-def _init_wave(
-    shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
-    wave_start, wave_size, total_threads, local_dims, pvt_memsize_peritem,
-    wgidconstid, wgsizeconstid, localidregid, group_id, group_dims, mergedregs=False
-):
-    return WaveState(
-        wave_size=wave_size,
-        wave_idx=wave_start // wave_size,
-        shader_constants=shader_constants,
-        wgidconstid=wgidconstid,
-        wgsizeconstid=wgsizeconstid,
-        localidregid=localidregid,
-        wgid=group_id,
-        wgsize=local_dims,
-        local_dims=local_dims,
-        mergedregs=mergedregs
-    )
 
 def _int_to_byte_arr(arr):
     ret = []
@@ -1509,6 +1502,29 @@ def _decode_program(shader):
     ]
     return instructions, jump_locations
 
+_ANALYSIS: dict[tuple, tuple] = {}
+
+def _analyse(shader, mergedregs: bool, nlanes: int) -> tuple:
+    """Everything about a kernel that does not change between dispatches of it: the decoded instructions, which of them the scheduler
+    handles itself (branches, predication, barriers, the end), the branch targets, the runs of instructions fused into one kernel
+    (lowered up front, in parallel when they are not cached) and the scheduler's per-pc table, filled in as the kernel runs."""
+    key = (hashlib.sha256(array.array("I", [int(w) & 0xFFFFFFFF for w in shader]).tobytes()).digest(), mergedregs, nlanes)
+    if key in _ANALYSIS: return _ANALYSIS[key]
+    decoded_shader, jump_locations = _decode_program(shader)
+    n_inst = len(decoded_shader)
+    special = [_is_cat0_branch(i) or _is_predication_enable_inst(i) or _is_predication_disable_inst(i) or _is_barrier_inst(i) or _is_end_inst(i) for i in decoded_shader]
+    leaders = {0} | {_branch_target(i.fields[-1].value, pc, jump_locations, n_inst) for pc, i in enumerate(decoded_shader) if _is_cat0_branch(i) and i.fields and _inst_name(i) != "ret"}
+    blocks, pc = [], 0
+    while pc < n_inst:
+        n = 1
+        if not special[pc]:
+            while pc + n < n_inst and n < MAX_BLOCK and not special[pc + n] and (pc + n) not in leaders: n += 1
+            blocks.append(tuple(i for inst in decoded_shader[pc:pc + n] for i in _expand_repeat(inst)))
+        pc += n
+    _precompile(blocks, mergedregs, nlanes)
+    _ANALYSIS[key] = (decoded_shader, jump_locations, special, leaders, {})
+    return _ANALYSIS[key]
+
 def _apply_wave_predication(inst: Inst, state: WaveState) -> None:
     """Apply A6xx predt/predf/prede state to the wave execution mask."""
     name = _inst_name(inst).lower()
@@ -1523,7 +1539,7 @@ def _apply_wave_predication(inst: Inst, state: WaveState) -> None:
     elif name == "prede":
         state.predication_mode = "none"
         state.exec_mask = state.lane_mask
-    state._exec_mask_mv[0] = state.exec_mask & 0xFFFFFFFFFFFFFFFF
+    state._push_exec_mask()
 
 
 def _is_cat0_branch(inst: Inst) -> bool:
@@ -1599,8 +1615,11 @@ def _execute_cat0_branch(info: tuple, state: WaveState, pc: int) -> int:
     masks = [(state._read_p_reg(reg, comp) ^ (state.launch_mask if invert else 0)) & state.launch_mask for invert, reg, comp in preds]
     active = state.exec_mask & state.lane_mask
     if name == "br": taken = masks[0] & active
-    elif name == "bany": taken = active if masks[0] & active else 0  # bany/ball reduce over the wave, so they never diverge
-    elif name == "ball": taken = active if active and (masks[0] & active) == active else 0
+    elif name in {"bany", "ball"}:  # these reduce over a hardware wave (64 lanes), so they never diverge within it
+        taken = 0
+        for w in range(state.n_waves):
+            aw, mw = (active >> (64 * w)) & 0xFFFFFFFFFFFFFFFF, (masks[0] >> (64 * w)) & 0xFFFFFFFFFFFFFFFF
+            if (mw & aw if name == "bany" else aw and (mw & aw) == aw): taken |= aw << (64 * w)
     else: taken = ((masks[0] | masks[1]) if name == "brao" else (masks[0] & masks[1])) & active
     if taken == active: return _goto(state, pc, target)
     if not taken: return pc + 1
@@ -1612,7 +1631,7 @@ def _execute_cat0_branch(info: tuple, state: WaveState, pc: int) -> int:
 def _refresh_exec_mask(state: WaveState) -> None:
     state.exec_mask = state.lane_mask if state.predication_mode == "none" else _combine_predicated_exec_mask(
         state.lane_mask, state.predication_mask, state.predication_mode, state.wave_size)
-    state._exec_mask_mv[0] = state.exec_mask & 0xFFFFFFFFFFFFFFFF
+    state._push_exec_mask()
 
 
 def _park(state: WaveState, pc: int, lanes: int) -> None:
@@ -1636,15 +1655,9 @@ def _unpark(state: WaveState, pc: int) -> None:
 
 
 def _dump_lane0(st: WaveState) -> str:
-    full = {f"r{i // 4}.{'xyzw'[i % 4]}": st._r_reg_mv[i] for i in range(NUM_R_REG) if st._r_reg_mv[i]}
-    half_base = 0 if st.mergedregs else NUM_R_REG * 2
-    half = {f"hr{i // 4}.{'xyzw'[i % 4]}": st._hr_reg_mv[half_base + i] for i in range(NUM_R_REG * 2) if st._hr_reg_mv[half_base + i]}
+    full = {f"r{i // 4}.{'xyzw'[i % 4]}": st._read_r_reg(0, i // 4, i % 4) for i in range(NUM_R_REG) if st._read_r_reg(0, i // 4, i % 4)}
+    half = {f"hr{i // 4}.{'xyzw'[i % 4]}": st._read_r_reg(0, i // 4, i % 4, half=True) for i in range(NUM_R_REG * 2) if st._read_r_reg(0, i // 4, i % 4, half=True)}
     return " ".join(f"{k}={v:#x}" for k, v in {**full, **half}.items())
-
-
-def _barrier_resume_ready(waves: list[WaveState]) -> bool:
-    if not waves: return False
-    return all(w.barrier_waiting for w in waves)
 
 
 def _descriptor_buffer(words, what: str) -> Buffer:
@@ -1664,6 +1677,10 @@ def _descriptor_buffer(words, what: str) -> Buffer:
     return buf
 
 
+# Hardware waves run together as one wide wave (see WaveState); this many at most. Whole workgroups are packed, so a workgroup of w waves
+# brings WAVES_PER_CALL // w workgroups. Wider means fewer scheduler steps but more lanes that sit idle where waves diverge.
+WAVES_PER_CALL = int(os.environ.get("QCOM_EMU_WAVES", "16"))
+
 def run_asm(
     shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
     global_dims, group_dims, local_dims, kerneldim, wave_size,
@@ -1672,29 +1689,23 @@ def run_asm(
 ):
     if wave_size != 64:
         raise NotImplementedError(f"QCOM UOp runner currently supports wave64 only, got wave_size={wave_size}")
-    decoded_shader, jump_locations = _decode_program(shader)
-
-    program: dict[int, tuple[bool, Any, bool, bool, bool, Inst, int]] = {}
-
     total_threads = math.prod(local_dims)
+    waves_per_group = ceildiv(total_threads, wave_size)
+    total_groups = math.prod(group_dims)
+    groups_per_batch = min(max(1, WAVES_PER_CALL // waves_per_group), total_groups)
+    n_waves = groups_per_batch * waves_per_group
+    nlanes = n_waves * wave_size
+    shared_stride = 32 * 1024  # a6xx local memory per workgroup is at most 32KB (SP_CS_CNTL_1.SHARED_SIZE is 5 bits of 1KB units and tinygrad writes a byte count into it)
 
     vmem_buf = Buffer("CPU", 1<<48, options=BufferSpec(external_ptr=0)).ensure_allocated()
     pvt_bytes_per_lane = pvt_memsize_peritem * 512  # MEMSIZEPERITEM is in 512-byte units (ops_qcom: round_up(pvtmem, 512) >> 9)
 
+    decoded_shader, jump_locations, special, leaders, program = _analyse(shader, mergedregs, nlanes)
     n_inst = len(decoded_shader)
-    # Instructions that need the scheduler: branches, predication, barriers and the end. Everything between them is fused into runs.
-    special = [_is_cat0_branch(i) or _is_predication_enable_inst(i) or _is_predication_disable_inst(i) or _is_barrier_inst(i) or _is_end_inst(i) for i in decoded_shader]
-    leaders = {0} | {_branch_target(i.fields[-1].value, pc, jump_locations, n_inst) for pc, i in enumerate(decoded_shader) if _is_cat0_branch(i) and i.fields and _inst_name(i) != "ret"}
     def _run_len(pc):  # a run stops before a branch target (lanes can arrive there from elsewhere) and before anything special
         n = 1
         while pc + n < n_inst and n < MAX_BLOCK and not special[pc + n] and (pc + n) not in leaders: n += 1
         return n
-    blocks, pc = [], 0
-    while pc < n_inst:  # the runs the scheduler will execute, lowered up front (in parallel) when they are not cached
-        n = 1 if special[pc] else _run_len(pc)
-        if not special[pc]: blocks.append(tuple(i for inst in decoded_shader[pc:pc + n] for i in _expand_repeat(inst)))
-        pc += n
-    _precompile(blocks, mergedregs)
     trace_regs = DEBUG >= 6  # also dump lane 0's registers after every instruction
     stats = [0.0, 0] if os.environ.get("QCOM_EMU_STATS") else None  # [seconds inside compiled kernels, kernel calls], printed when run_asm returns
     trace = DEBUG >= 5  # read once: ContextVar comparisons are slow in a loop that runs once per instruction
@@ -1707,98 +1718,79 @@ def run_asm(
             else:
                 n = 1 if special[pc] else _run_len(pc)
                 prev_len = _get_block_runner.cache_info().currsize
-                runner = _compile_run(pc, decoded_shader, n, mergedregs)
-                program[pc] = (False, [(runner[1].fxn, runner[0].arg.globals)] if runner is not None else [], _is_barrier_inst(inst), _is_end_inst(inst),
+                runner = _compile_run(pc, decoded_shader, n, mergedregs, nlanes)
+                program[pc] = (False, [(runner[1].fxn, runner[0])] if runner is not None else [], _is_barrier_inst(inst), _is_end_inst(inst),
                                _is_predication_enable_inst(inst) or _is_predication_disable_inst(inst), inst, n)
                 if DEBUG >= 3:
                     msg = f"[emu] PC={pc}..{pc + n - 1}: {inst!r}"
                     print(colored(msg, 'green') if _get_block_runner.cache_info().currsize > prev_len else msg)
         return program[pc]
 
-    shared_buf = Buffer('CPU', max(shared_memsize, 1)).ensure_allocated()
+    shared_buf = Buffer('CPU', shared_stride * groups_per_batch).ensure_allocated()
     tex_buf, ibo_buf = _descriptor_buffer(shader_tex_constants, "texture"), _descriptor_buffer(shader_uav, "IBO")
-    pool: list[Any] = []  # the waves of a workgroup are the same objects for every workgroup, just reset: (state, buffers, kernel args, images)
+    wsbase_buf = Buffer('CPU', 4 * n_waves).ensure_allocated()
+    for w in range(n_waves): ctypes.c_uint32.from_address(wsbase_buf._buf + 4 * w).value = (w // waves_per_group) * shared_stride
+    pool: list[Any] = []  # the wide wave is the same object for every batch of workgroups, just reset: (state, buffers, kernel args, images)
 
-    def _run_workgroup(group_id):
-        ctypes.memset(shared_buf._buf, 0, max(shared_memsize, 1))
+    def _run_batch(group_ids):
+        ctypes.memset(shared_buf._buf, 0, shared_stride * groups_per_batch)
         if not pool:
-            for wave_start in range(0, total_threads, wave_size):
-                st = _init_wave(
-                    shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
-                    wave_start, wave_size, total_threads, local_dims, pvt_memsize_peritem,
-                    wgidconstid, wgsizeconstid, localidregid, group_id, group_dims, mergedregs
-                )
-                pvt_buf = Buffer('CPU', max(pvt_bytes_per_lane * wave_size, 1)).ensure_allocated()
-                tmp_buf = Buffer('CPU', 4 * wave_size * 4).ensure_allocated()
-                pool.append((st,
-                    [
-                        ctypes.c_uint64(st.r_reg._buf),
-                        ctypes.c_uint64(st.s_reg._buf),
-                        ctypes.c_uint64(st.c_reg._buf),
-                        ctypes.c_uint64(st.a_reg._buf),
-                        ctypes.c_uint64(st.p_reg._buf),
-                        ctypes.c_uint64(vmem_buf._buf),
-                        ctypes.c_uint64(shared_buf._buf),
-                        ctypes.c_uint64(pvt_buf._buf),
-                        ctypes.c_uint64(st.exec_mask_buf._buf),
-                        ctypes.c_uint64(tmp_buf._buf),
-                        ctypes.c_uint64(tex_buf._buf),
-                        ctypes.c_uint64(ibo_buf._buf)
-                    ], {}, st.snapshot(), pvt_buf))
-        else:
-            for st, _, _, images, _ in pool: st.reset(images, wgidconstid, group_id)
-        for _, _, _, _, pvt_buf in pool: ctypes.memset(pvt_buf._buf, 0, max(pvt_bytes_per_lane * wave_size, 1))
-        waves = [(st, bufs, calls_at) for st, bufs, calls_at, _, _ in pool]
-        done = [False] * len(waves)
+            st = WaveState(nlanes, shader_constants, wgidconstid, wgsizeconstid, localidregid, group_ids, local_dims, local_dims, mergedregs)
+            pvt_buf = Buffer('CPU', max(pvt_bytes_per_lane * nlanes, 1)).ensure_allocated()
+            tmp_buf = Buffer('CPU', 4 * lane_stride(nlanes) * 4).ensure_allocated()
+            pool.append((st,
+                [
+                    ctypes.c_uint64(st.r_reg._buf),
+                    ctypes.c_uint64(st.s_reg._buf),
+                    ctypes.c_uint64(st.c_reg._buf),
+                    ctypes.c_uint64(st.a_reg._buf),
+                    ctypes.c_uint64(st.p_reg._buf),
+                    ctypes.c_uint64(vmem_buf._buf),
+                    ctypes.c_uint64(shared_buf._buf),
+                    ctypes.c_uint64(pvt_buf._buf),
+                    ctypes.c_uint64(st.exec_mask_buf._buf),
+                    ctypes.c_uint64(tmp_buf._buf),
+                    ctypes.c_uint64(tex_buf._buf),
+                    ctypes.c_uint64(ibo_buf._buf),
+                    ctypes.c_uint64(wsbase_buf._buf)
+                ], {}, st.snapshot(), pvt_buf))
+        else: pool[0][0].reset(pool[0][3], wgidconstid, group_ids)
+        st, bufs, calls_at, _, pvt_buf = pool[0]
+        ctypes.memset(pvt_buf._buf, 0, max(pvt_bytes_per_lane * nlanes, 1))
         for _ in range(10_000_000):
-            if all(done): return
-            active_waves = [w for wi, w in enumerate(waves) if not done[wi]]
-            if any(st.barrier_waiting for st, _, _ in active_waves):
-                # A workgroup barrier is only valid when every wave still participating
-                # in the workgroup reaches it. If another wave has already ended, do not
-                # accidentally release the waiting waves as though that wave had arrived.
-                if any(done):
-                    raise RuntimeError("workgroup reached a barrier after another wave had already completed")
-                if _barrier_resume_ready([st for st, _, _ in active_waves]):
-                    for st, _, _ in active_waves:
-                        st.barrier_waiting = False
-            for wi, (st, bufs, calls_at) in enumerate(waves):
-                if done[wi] or st.barrier_waiting: continue
-                for _ in range(1_000_000):
-                    if not st.lane_mask and st.parked:  # every lane is parked: run on (as no-ops) to the next reconvergence point
-                        st.pc = min((k for k in st.parked if k >= st.pc), default=min(st.parked))
-                    if st.pc in st.parked: _unpark(st, st.pc)
-                    pc = st.pc
-                    if not 0 <= pc < n_inst:
-                        raise RuntimeError(f"wave {wi} reached PC {pc} outside shader ({n_inst} instructions)")
-                    is_branch, runners, is_barrier, is_end, is_pred, inst, run_len = _ensure_compiled(pc)
-                    st.pc += run_len
-                    if trace: print(f"  exec gid=({group_id[0]},{group_id[1]},{group_id[2]}) w={wi} PC={pc}: {inst!r}", flush=True)
-                    if is_branch:
-                        st.pc = _execute_cat0_branch(runners, st, pc)
-                        continue
-                    if (calls:=calls_at.get(pc)) is None:  # the kernel argument arrays only depend on the wave, so build them once
-                        calls = calls_at[pc] = [(fxn, (ctypes.c_uint64 * len(gl))(*[bufs[g].value for g in gl])) for fxn, gl in runners]
-                    if stats is not None:
-                        t0 = time.perf_counter()
-                        for fxn, args in calls: fxn(args)
-                        stats[0] += time.perf_counter() - t0
-                        stats[1] += len(calls)
-                    else:
-                        for fxn, args in calls: fxn(args)
-                    if is_pred: _apply_wave_predication(inst, st)
-                    if trace_regs: print("    lane0:", _dump_lane0(st), flush=True)
-                    if is_end:
-                        done[wi] = True
-                        break
-                    if is_barrier:
-                        st.barrier_waiting = True
-                        break
-                else: raise RuntimeError("exceeded 1M instructions in single wave, likely infinite loop")
-        raise RuntimeError("exceeded 10M total scheduling rounds")
+            if not st.lane_mask and st.parked:  # every lane is parked: run on (as no-ops) to the next reconvergence point
+                st.pc = min((k for k in st.parked if k >= st.pc), default=min(st.parked))
+            if st.pc in st.parked: _unpark(st, st.pc)
+            pc = st.pc
+            if not 0 <= pc < n_inst:
+                raise RuntimeError(f"reached PC {pc} outside shader ({n_inst} instructions)")
+            is_branch, runners, is_barrier, is_end, is_pred, inst, run_len = _ensure_compiled(pc)
+            st.pc += run_len
+            if trace: print(f"  exec gids={group_ids[0]}..{group_ids[-1]} PC={pc}: {inst!r}", flush=True)
+            if is_branch:
+                st.pc = _execute_cat0_branch(runners, st, pc)
+                continue
+            if (calls:=calls_at.get(pc)) is None:  # the kernel argument arrays do not change, so build them once
+                calls = calls_at[pc] = [(fxn, (ctypes.c_uint64 * len(gl))(*[bufs[g].value for g in gl])) for fxn, gl in runners]
+            if stats is not None:
+                t0 = time.perf_counter()
+                for fxn, args in calls: fxn(args)
+                stats[0] += time.perf_counter() - t0
+                stats[1] += len(calls)
+            else:
+                for fxn, args in calls: fxn(args)
+            if is_pred: _apply_wave_predication(inst, st)
+            if trace_regs: print("    lane0:", _dump_lane0(st), flush=True)
+            # A barrier needs no rendezvous: the waves of a workgroup are lanes of the same wide wave, so they are in step.
+            if is_end:  # the lanes that are running end; lanes parked elsewhere still have to get here
+                st.lane_mask = 0
+                _refresh_exec_mask(st)
+                if not st.parked: return
+        raise RuntimeError("exceeded 10M scheduling steps in one batch, likely an infinite loop")
     (group_x, group_y, group_z) = group_dims
 
     t_start = time.perf_counter()
-    for gidz, gidy, gidx in itertools.product(range(group_z), range(group_y), range(group_x)):
-        _run_workgroup((gidx, gidy, gidz))
-    if stats is not None: print(f"[emu stats] {group_x * group_y * group_z} workgroups: {time.perf_counter() - t_start:.3f}s total, {stats[0]:.3f}s in {stats[1]} kernel calls", flush=True)
+    all_groups = list(itertools.product(range(group_z), range(group_y), range(group_x)))
+    for i in range(0, total_groups, groups_per_batch):
+        _run_batch([(gx, gy, gz) for gz, gy, gx in all_groups[i:i + groups_per_batch]])
+    if stats is not None: print(f"[emu stats] {total_groups} workgroups in batches of {groups_per_batch}: {time.perf_counter() - t_start:.3f}s total, {stats[0]:.3f}s in {stats[1]} kernel calls", flush=True)
