@@ -22,15 +22,14 @@ from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.dtype import dtypes
 
 NUM_R_REG = 48 * 4
-# per-lane storage: the 48 full vec4 registers, then a separate half-register file. SP_CS_CNTL_0.MERGEDREGS selects whether hrN.c aliases the
-# halves of the full registers (merged) or lives in the separate file; tinygrad leaves the bit clear
+# half registers are a separate file, or alias the full ones when MERGEDREGS is set (tinygrad leaves it clear)
 R_WORDS = NUM_R_REG * 2
 NUM_S_REG = 8 * 4
 NUM_C_REG = 512 * 4
 NUM_A_REG = 2 * 1
 NUM_P_REG = 1 * 4
-def lane_stride(nlanes: int) -> int: return nlanes + 16  # words between consecutive slots of the slot-major register files
-NUM_IMG_DESC = 32  # texture / IBO descriptors visible to a shader
+def lane_stride(nlanes: int) -> int: return nlanes + 16  # slot stride
+NUM_IMG_DESC = 32
 
 def _c(val, dtype=dtypes.uint32): return UOp.const(val, dtype)
 
@@ -44,13 +43,13 @@ def _as_reg_bits(value: UOp) -> UOp:
     return value.cast(dtypes.uint32)
 
 def _as_float16(value: UOp) -> UOp:
-    # a register's low 16 bits as binary16; typed float immediates are already numerical values
+    # low 16 bits as binary16, typed float immediates are already values
     if value.dtype == dtypes.float16: return value.cast(dtypes.float32)
     if value.dtype == dtypes.float32: return value.cast(dtypes.float16).cast(dtypes.float32)
     return value.cast(dtypes.uint16).bitcast(dtypes.float16).cast(dtypes.float32)
 
 def _qcom_demoted_const_f16(ctx, token: str, lane: UOp) -> UOp:
-    # a half-precision float read of a constant converts the 32-bit constant f32 -> f16 (CONSTANT_DEMOTION_ENABLE)
+    # a half read of a constant demotes f32 to f16
     _, reg, dim = _qcom_reg_token(token)
     return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane).bitcast(dtypes.float32).cast(dtypes.float16).cast(dtypes.float32)
 
@@ -71,7 +70,7 @@ def _thread_active(exec_mask: UOp, lane_in_wave: UOp) -> UOp:
     return ((exec_mask >> lane_in_wave.cast(dtypes.uint64)) & UOp.const(1, dtypes.uint64)).ne(UOp.const(0, dtypes.uint64))
 
 class _Ctx:
-    r_reg: UOp  # the kernel's buffers are its arguments, in this order (see __init__)
+    r_reg: UOp  # buffers, in kernel argument order
     s_reg: UOp
     c_reg: UOp
     a_reg: UOp
@@ -82,7 +81,7 @@ class _Ctx:
     tmp: UOp
     def __init__(self, wave_size = 64, merged = False):
         self._axis_id = 0
-        self.wave_size = wave_size  # 64 lanes per hardware wave; lane L belongs to wave L // 64
+        self.wave_size = wave_size  # 64 lanes per hardware wave
         self.merged = merged
         waves = wave_size // 64
         self.stride = stride = lane_stride(wave_size)
@@ -92,21 +91,20 @@ class _Ctx:
             "p_reg": UOp.param(4, dtypes.uint32, NUM_P_REG * stride, name="p_reg"),
             "vmem": UOp.param(5, dtypes.uint8, 1<<48, name="vmem"),  # host VAs reach 2**47
             "shared": UOp.param(6, dtypes.uint8, 32 * 1024 * waves, name="shared"), "pvt_mem": UOp.param(7, dtypes.uint8, 1 << 30, name="pvt_mem"),
-            "tmp": UOp.param(9, dtypes.uint32, 4 * stride, name="tmp")}  # scratch: swz/gat/sct park their sources here
-        self._exec_mask = UOp.param(8, dtypes.uint64, waves, name="exec_mask")  # one word per hardware wave
-        self.tex = UOp.param(10, dtypes.uint32, 16 * NUM_IMG_DESC, name="tex")  # 16-dword A6XX_TEX_CONST descriptors
+            "tmp": UOp.param(9, dtypes.uint32, 4 * stride, name="tmp")}  # scratch for swz, gat and sct
+        self._exec_mask = UOp.param(8, dtypes.uint64, waves, name="exec_mask")  # one word per wave
+        self.tex = UOp.param(10, dtypes.uint32, 16 * NUM_IMG_DESC, name="tex")  # A6XX_TEX_CONST descriptors
         self.ibo = UOp.param(11, dtypes.uint32, 16 * NUM_IMG_DESC, name="ibo")
-        self.wsbase = UOp.param(12, dtypes.uint32, waves, name="wsbase")  # byte offset of each wave's workgroup in the shared memory buffer
+        self.wsbase = UOp.param(12, dtypes.uint32, waves, name="wsbase")  # shared memory offset per wave
         self._w: Any = None
         self._l: Any = None
         for name, buf in self._bufs.items(): setattr(self, name, buf)
 
-    def advance(self, done: UOp) -> None:  # every later access to a buffer waits for `done`, so instructions can share one kernel
+    def advance(self, done: UOp) -> None:  # later accesses wait for done
         for name, buf in self._bufs.items(): setattr(self, name, buf.after(done))
 
     def range(self) -> UOp:
-        # the lane index as two nested loops, over the hardware waves then the 64 lanes of one: what belongs to the wave (exec mask, s/c/a
-        # registers) is invariant in the inner loop, which the C compiler can vectorize
+        # lane index as nested wave and lane loops, so wave state is invariant in the inner loop
         self._axis_id += 2
         self._w = UOp.range(self.wave_size // 64, self._axis_id - 1, dtype=dtypes.int)
         self._l = UOp.range(64, self._axis_id, dtype=dtypes.int)
@@ -117,7 +115,7 @@ class _Ctx:
     def wave_of(self, thread_id: UOp) -> UOp: return self._w
 
     def _slot(self, reg_num: UOp, reg_dim: UOp) -> UOp: return reg_num.cast(dtypes.int) * _c(4, dtypes.int) + reg_dim.cast(dtypes.int)
-    def _half_word(self, half_slot: UOp, thread_id: UOp) -> UOp:  # half slot h is the low (even) or high (odd) half of word h // 2
+    def _half_word(self, half_slot: UOp, thread_id: UOp) -> UOp:  # half slot h is the low or high half of word h // 2
         return _c(0 if self.merged else NUM_R_REG * self.stride, dtypes.int) + (half_slot >> _c(1, dtypes.int)) * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)
     def _half_shift(self, half_slot: UOp) -> UOp: return (half_slot & _c(1, dtypes.int)).cast(dtypes.uint32) * _c(16, dtypes.uint32)
     def _set_half(self, old: UOp, val: UOp, shift: UOp) -> UOp:
@@ -128,8 +126,7 @@ class _Ctx:
         if half: return (self.r_reg.index(self._half_word(slot, thread_id)).load() >> self._half_shift(slot)) & _c(0xFFFF, dtypes.uint32)
         return self.r_reg.index(slot * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)).load()
 
-    # stores are unconditional read-modify-writes that keep the old value in inactive lanes: a store guarded by the exec mask is a branch the
-    # C compiler cannot vectorize across, a blend it can
+    # stores blend with the old value instead of branching on the exec mask
     def write_r_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, val: UOp, exec_mask: UOp, after: UOp | None = None, half=False):
         buf = self.r_reg.after(after) if after is not None else self.r_reg
         slot = self._slot(reg_num, reg_dim)
@@ -141,7 +138,7 @@ class _Ctx:
         idx = slot * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)
         return buf.index(idx).store(active.where(val.cast(dtypes.uint32), buf.index(idx).load()))
 
-    # the s (r48-r55) and c registers are per hardware wave; a half register is the low or high half of a word
+    # s and c registers are per wave
     def _wave_read(self, buf: UOp, size: int, reg_num: UOp, reg_dim: UOp, thread_id: UOp, half: bool):
         slot = self._slot(reg_num, reg_dim)
         word = buf.index(self.wave_of(thread_id) * _c(size, dtypes.int) + (slot // _c(2, dtypes.int) if half else slot)).load()
@@ -167,7 +164,7 @@ class _Ctx:
         buf = self.a_reg.after(after) if after is not None else self.a_reg
         return buf.index(self.wave_of(thread_id) * _c(NUM_A_REG, dtypes.int) + reg_num.cast(dtypes.int)).store(val.cast(dtypes.uint32))
 
-    # one 0/1 value per lane; WaveState packs it to a mask when the scheduler needs a wave-uniform decision
+    # one 0/1 word per lane
     def read_p_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp):
         return self.p_reg.index(self._slot(reg_num, reg_dim) * _c(self.stride, dtypes.int) + thread_id.cast(dtypes.int)).load()
     def write_p_reg(self, reg_num: UOp, reg_dim: UOp, thread_id: UOp, val: UOp, exec_mask: UOp, after: UOp | None = None):
@@ -177,7 +174,7 @@ class _Ctx:
 
 def _compile_cat0(inst, ctx):
     name = _inst_name(inst).strip().lower()
-    if name in {"nop", "end", "predt", "predf", "prede"}: return UOp.sink()  # the effects are in the wave scheduler
+    if name in {"nop", "end", "predt", "predf", "prede"}: return UOp.sink()  # handled by the scheduler
     if name in {"jump", "call", "ret", "br", "bany", "ball", "brao", "braa", "brax", "bkt", "kill", "emit", "cut", "chmask", "chsh", "flow_rev", "shpe", "getlast", "getone", "shps", "brac"}:
         raise NotImplementedError(f"Category 0 instruction {name!r} is handled by the wave scheduler or needs unsupported subgroup/geometry semantics")
     raise RuntimeError(f"Unknown category 0 instruction: {name!r}")
@@ -186,7 +183,7 @@ def _write_qcom_store(ctx: _Ctx, token: str, lane: UOp, value: UOp, after: UOp |
     kind, reg, dim = _qcom_reg_token(token)
     r, d = _c(reg, dtypes.int), _c(dim, dtypes.int)
     half = kind in {"hr", "hs", "hc"}
-    if half:  # a half register holds the raw 16 bits
+    if half:  # raw 16 bits
         if value.dtype == dtypes.float32: value = value.cast(dtypes.float16)
         value = value.bitcast(dtypes.uint16) if value.dtype == dtypes.float16 else value.cast(dtypes.uint16)
     if kind in {"r", "hr"}: return ctx.write_r_reg(r, d, lane, _as_reg_bits(value), ctx.read_exec_mask(lane), after=after, half=half)
@@ -199,7 +196,7 @@ def _write_qcom_store(ctx: _Ctx, token: str, lane: UOp, value: UOp, after: UOp |
 def _write_qcom_value(ctx: _Ctx, token: str, lane: UOp, value: UOp): return UOp.sink(_write_qcom_store(ctx, token, lane, value))
 
 def _qcom_reg_component_offset_token(token: str, delta: int) -> str:
-    # advance a vector operand by components, carrying w into the next register's x
+    # step a vector operand by components, w carries into the next register
     kind, reg, dim = _qcom_reg_token(token)
     if kind not in {"r", "hr", "c", "hc", "s", "hs"}: raise NotImplementedError(f"Multi-component accesses require r/c/s registers, got {token!r}")
     slot = reg * 4 + dim + delta
@@ -225,7 +222,7 @@ def _qcom_encode_typed(value: UOp, typ: str) -> UOp:
     return value.cast(dtypes.uint8).cast(dtypes.uint32) if typ == "u8_32" else value.cast(_QCOM_TYPE_DTYPES[typ])
 
 def _qcom_u8_source_extends(src: UOp, src_type: str, dst_type: str) -> UOp:
-    # an 8-bit cov/mov source sign-extends (ir3_compiler_nir.c uses `cov.u8s16` for i2i16/i2f of int8 and masks with 0xff where it needs zero extension)
+    # 8 bit cov and mov sources sign extend
     return src.bitcast(dtypes.int8) if src_type == "u8" and dst_type != "u8" else src
 
 def _compile_cat1(inst, ctx):
@@ -237,27 +234,26 @@ def _compile_cat1(inst, ctx):
     if op in {"swz", "gat", "sct"}:
         if len(inst.fields) != (5 if op == "swz" else 6): raise RuntimeError(f"{op} has the wrong number of operands: {inst!r}")
         if op == "swz": vals, targets = [_qcom_read_operand(ctx, f.value, lane, f.modifiers) for f in inst.fields[3:5]], [f.value for f in inst.fields[1:3]]
-        elif op == "gat":  # SRC0..SRC3 to DST0..DST0 + 3
+        elif op == "gat":  # consecutive dst
             vals = [_qcom_read_operand(ctx, f.value, lane, f.modifiers) for f in inst.fields[2:6]]
             targets = [_qcom_reg_component_offset_token(inst.fields[1].value, i) for i in range(4)]
-        else:  # SRC0..SRC0 + 3 to DST0..DST3
+        else:  # consecutive src
             src = inst.fields[5]
             vals = [_qcom_read_operand(ctx, _qcom_reg_component_offset_token(src.value, i), lane, src.modifiers) for i in range(4)]
             targets = [f.value for f in inst.fields[1:5]]
-        # these move in parallel (swz can swap two registers), so every source is read before any destination is written. The scheduler is free to
-        # move a load past a store to the same word (two half registers share one) within a loop, so a first loop parks the sources in a scratch buffer
+        # parallel move, park the sources in scratch first so a load cannot move past a store to a shared half word
         parked = _end_lane_range(UOp.sink(*[ctx.tmp.index(_c(i * ctx.stride, dtypes.int) + lane).store(_as_reg_bits(v)) for i, v in enumerate(vals)]))
         ctx.advance(parked)
         lane = ctx.range()
         stores: list[UOp] = []
-        for i, dst in enumerate(targets):  # chained: half destinations share words, so the read-modify-write stores must not overlap
+        for i, dst in enumerate(targets):  # chained, half registers share words
             stores.append(_write_qcom_store(ctx, dst, lane, ctx.tmp.index(_c(i * ctx.stride, dtypes.int) + lane).load(), after=stores[-1] if stores else None))
         return UOp.sink(*stores)
 
     if len(inst.fields) < 3: raise RuntimeError(f"Category 1 instruction is missing operands: {inst!r}")
     dst, src_field = inst.fields[1].value, inst.fields[2]
     if op in {"movs", "movmsk"}: raise NotImplementedError(f"{op} is not modeled")
-    pair = _qcom_split_type_pair(suffix) if op in {"cov", "mov"} else None  # the mnemonic carries the source and destination types, e.g. mov.f32f32
+    pair = _qcom_split_type_pair(suffix) if op in {"cov", "mov"} else None  # suffix is the source and destination type
     if op == "cov" and pair is None: raise NotImplementedError(f"Unsupported conversion type pair in {name!r}")
     if pair is not None:
         src = _qcom_u8_source_extends(_qcom_read_typed_operand(ctx, src_field, lane, pair[0]), *pair)
@@ -279,7 +275,7 @@ def _qcom_reg_token(token: str) -> tuple[str, int, int]:
     kind = match.group("kind").lower()
     reg = int(match.group("reg"))
     dim = {"x": 0, "y": 1, "z": 2, "w": 3}.get(match.group("dim") or "x", 0)
-    # a6xx has 48 per-lane GPRs; the registers numbered 48-55 are the wave-shared file (ir3 prints them as r48.x..r55.w)
+    # 48 registers per lane, 48-55 are wave shared
     if kind in {"r", "hr"} and reg >= 48: return "s" if kind == "r" else "hs", reg - 48, dim
     return kind, reg, dim
 
@@ -290,8 +286,7 @@ def _qcom_read_value(ctx: _Ctx, token: str, lane: UOp) -> UOp:
     if kind == "hr": return ctx.read_r_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, half=True)
     if kind in {"s", "hs"}: return ctx.read_s_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane, half=(kind == "hs"))
     if kind == "c": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
-    # CONSTANT_DEMOTION_ENABLE (set by ops_qcom for IR3): hcN.c is the full 32-bit constant cN.c, demoted for the half-precision reader.
-    # Integer readers see the low 16 bits (u2u16, done here); float readers convert f32->f16 (_qcom_demoted_const_f16). ir3_cp.c.
+    # hcN is the full constant cN demoted, integer readers take the low 16 bits
     if kind == "hc": return ctx.read_c_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane) & _c(0xFFFF, dtypes.uint32)
     if kind == "a": return ctx.read_a_reg(_c(reg, dtypes.int), lane)
     if kind == "p": return ctx.read_p_reg(_c(reg, dtypes.int), _c(dim, dtypes.int), lane)
@@ -300,7 +295,7 @@ def _qcom_read_value(ctx: _Ctx, token: str, lane: UOp) -> UOp:
 
 def _parse_qcom_imm(token: str) -> UOp:
     token = token.strip()
-    if token.lower().startswith("h("): token = token[1:]  # half-precision immediate, h(255) / h(1.5) (ir3-common.xml #mulitsrc-immed, cat1 #cat1-immed-src)
+    if token.lower().startswith("h("): token = token[1:]  # half immediate
     if token.startswith("(") and token.endswith(")"): token = token[1:-1]
     if token.lower() in _QCOM_FLUT_IMMS: return UOp.const(_QCOM_FLUT_IMMS[token.lower()], dtypes.float32)
     if token in {"0", "1"}:
@@ -322,8 +317,7 @@ def _qcom_read_raw_operand(ctx: _Ctx, token: str, lane: UOp, modifiers: list[str
     try:
         return _qcom_read_value(ctx, token, lane), mods
     except ValueError:
-        # Only non-register tokens are immediates. Do not hide malformed/unsupported
-        # register classes by falling through to the numeric literal parser.
+        # only non register tokens are immediates
         if _QCOM_REG_RE.fullmatch(token.strip()) is not None or "[" in token or "]" in token:
             raise
         return _parse_qcom_imm(token), mods
@@ -338,20 +332,19 @@ def _qcom_read_typed_operand(ctx: _Ctx, field, lane: UOp, typ: str) -> UOp:
     raw, mods = _qcom_read_raw_operand(ctx, field.value, lane, field.modifiers)
     if typ == "f16" and _QCOM_REG_RE.fullmatch(field.value.strip()) and _qcom_reg_token(field.value)[0] == "hc":
         return _apply_qcom_operand_modifiers(_qcom_demoted_const_f16(ctx, field.value, lane), mods)
-    # signed integer ALU ops on half registers / h(imm) sources work on 16-bit values: sign-extend from bit 15, not from bit 31
+    # signed ops on half sources sign extend from bit 15
     if typ == "s32" and field.value.strip().lower().startswith("h"): return _apply_qcom_operand_modifiers(_qcom_decode_typed(raw, "s16").cast(dtypes.int32), mods)
     return _apply_qcom_operand_modifiers(_qcom_decode_typed(raw, typ), mods)
 
 def _round_nearest_even(x: UOp) -> UOp:
     truncated = UOp(Ops.TRUNC, src=(x,))
-    away = (x < UOp.const(0.0, x.dtype)).where(truncated - _c(1.0, x.dtype), truncated + _c(1.0, x.dtype))  # the next integer away from zero
+    away = (x < UOp.const(0.0, x.dtype)).where(truncated - _c(1.0, x.dtype), truncated + _c(1.0, x.dtype))  # next integer away from zero
     frac = (x - truncated).abs()
     is_odd = (truncated.cast(dtypes.int32) & _c(1, dtypes.int32)).ne(_c(0, dtypes.int32))
-    return ((frac > UOp.const(0.5, x.dtype)) | (frac.eq(UOp.const(0.5, x.dtype)) & is_odd)).where(away, truncated)  # ties go to the even integer
+    return ((frac > UOp.const(0.5, x.dtype)) | (frac.eq(UOp.const(0.5, x.dtype)) & is_odd)).where(away, truncated)  # ties go to even
 
 
 def _round_away_from_zero(x: UOp) -> UOp:
-    # A6XX rndaz.f rounds to the nearest integer away from zero.
     sign = (x < UOp.const(0.0, x.dtype)).where(UOp.const(-1.0, x.dtype), UOp.const(1.0, x.dtype))
     return UOp(Ops.TRUNC, src=(x + (UOp.const(0.5, x.dtype) * sign),)).cast(x.dtype)
 
@@ -400,7 +393,7 @@ def _compile_cat2(inst, ctx):
     if len(inst.fields) < 3: raise RuntimeError(f"Category 2 instruction is missing operands: {inst!r}")
     lane = ctx.range()
     dst_token, src_fields = inst.fields[1].value, inst.fields[2:]
-    src_vals = [] if name == "absneg.s" else [_qcom_read_operand(ctx, f.value, lane, f.modifiers) for f in src_fields]  # absneg.s decodes as signed below
+    src_vals = [] if name == "absneg.s" else [_qcom_read_operand(ctx, f.value, lane, f.modifiers) for f in src_fields]
     u32 = lambda v: v.cast(dtypes.uint32)  # noqa: E731
     f32 = lambda x: UOp.const(x, dtypes.float32)  # noqa: E731
 
@@ -409,7 +402,7 @@ def _compile_cat2(inst, ctx):
         if name.endswith(".f"): srcf = _qcom_float_operand(ctx, src_fields[0], lane)
         elif name.endswith(".s"): srcf = _qcom_read_typed_operand(ctx, src_fields[0], lane, "s32")
         else: srcf = src_vals[0]
-        # absneg is the unary route that consumes the source abs/neg modifiers, the opcode itself does not apply abs()
+        # absneg only applies the source modifiers
         if name in {"absneg.f", "absneg.s"}: result = srcf
         elif name == "sign.f": result = (srcf < f32(0.0)).where(f32(-1.0), (srcf > f32(0.0)).where(f32(1.0), f32(0.0)))
         elif name == "floor.f": result = srcf.floor()
@@ -419,14 +412,14 @@ def _compile_cat2(inst, ctx):
         elif name == "trunc.f": result = srcf.trunc()
         elif name == "not.b": result = ~u32(src_vals[0])
         elif name == "bfrev.b": result = _qcom_bitreverse32(src_vals[0])
-        elif name == "clz.b":  # leading zeroes, or -1 for an input of 0
+        elif name == "clz.b":  # -1 for 0
             v = u32(src_vals[0])
             result = v.eq(_c(0)).where(_c(0xFFFFFFFF), _qcom_clz32(v))
-        elif name == "clz.s":  # leading bits (including sign) that match the sign bit, or -1 for an input of 0/~0
+        elif name == "clz.s":  # leading sign bits, -1 for 0 and ~0
             v = src_vals[0].cast(dtypes.int32)
-            flipped = u32(v ^ (v >> _c(31, dtypes.int32)))  # leading sign bits become leading zeros
+            flipped = u32(v ^ (v >> _c(31, dtypes.int32)))
             result = flipped.eq(_c(0)).where(_c(0xFFFFFFFF), _qcom_clz32(flipped))
-        else: result = _qcom_popcount32(src_vals[0])  # cbits.b
+        else: result = _qcom_popcount32(src_vals[0])
         return _write_qcom_value(ctx, dst_token, lane, _qcom_apply_instruction_flags(inst, result))
 
     if len(src_fields) != 2: raise RuntimeError(f"{name} expects two source operands: {inst!r}")
@@ -437,7 +430,7 @@ def _compile_cat2(inst, ctx):
         if cmp_type == "f": lhs, rhs = _qcom_float_operand(ctx, src_fields[0], lane), _qcom_float_operand(ctx, src_fields[1], lane)
         elif cmp_type in {"u", "s"}: lhs, rhs = (_qcom_read_typed_operand(ctx, f, lane, cmp_type + "32") for f in src_fields)
         else: raise RuntimeError(f"Unknown comparison type in {name!r}")
-        # cmpv is the vector-mask form (0xffffffff/0), cmps returns 0/1
+        # cmpv is a mask, cmps is 0 or 1
         result = _qcom_cmp(lhs, rhs, condition).where(_c(0xFFFFFFFF if cmp_kind == "cmpv" else 1), _c(0))
         return _write_qcom_value(ctx, dst_token, lane, _qcom_apply_instruction_flags(inst, result))
 
@@ -463,9 +456,9 @@ def _compile_cat2(inst, ctx):
     elif name == "xor.b": result = u32(a) ^ u32(b)
     elif name == "shl.b": result = u32(a) << sh
     elif name == "shr.b": result = u32(a) >> sh
-    elif name == "ashr.b": result = signed_a >> sh  # signed_a is s16-extended for half sources
+    elif name == "ashr.b": result = signed_a >> sh  # s16 extended for half sources
     elif name == "getbit.b": result = (u32(a) >> sh) & _c(1)
-    elif name == "mull.u": result = (u32(a) & _c(0xFFFF)) * (u32(b) & _c(0xFFFF))  # nir umul_16x16: unsigned product of the low 16 bits
+    elif name == "mull.u": result = (u32(a) & _c(0xFFFF)) * (u32(b) & _c(0xFFFF))  # low 16 bits
     else: raise RuntimeError(f"Unsupported category 2 instruction: {name!r}")
     return _write_qcom_value(ctx, dst_token, lane, _qcom_apply_instruction_flags(inst, result))
 
@@ -486,7 +479,7 @@ def _qcom_mem_dtype(suffix: str) -> Any:
 
 
 def _mem_byte_index(ctx: _Ctx, mem_kind: str, addr_i: UOp, i: int, lane: UOp) -> UOp:
-    # private memory is per lane: one buffer per wave, interleaved by dword across the lanes (lane l dword d is at d*wave_size*4 + l*4)
+    # private memory is interleaved by dword across lanes
     b = addr_i + _c(i, dtypes.int64)
     if mem_kind == "l": return b + ctx.wsbase.index(ctx.wave_of(lane)).load().cast(dtypes.int64)
     if mem_kind != "p": return b
@@ -505,11 +498,11 @@ def _load_mem_value(ctx: _Ctx, mem_kind: str, addr: UOp, suffix: str, lane: UOp)
         byte = mem.index(_mem_byte_index(ctx, mem_kind, safe_addr, i, lane).valid(active)).load().cast(raw_dtype)
         part = byte if i == 0 else byte << _c(8 * i, raw_dtype)
         raw = part if raw is None else raw | part
-    assert raw is not None  # nbytes >= 1
-    # Memory contains bits. Reinterpret signed and floating-point values rather than numerically casting them.
+    assert raw is not None
+    # memory holds bits, reinterpret instead of casting
     if dtype in {dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64, dtypes.float16, dtypes.float32}:
         decoded = raw.bitcast(dtype)
-        # Narrow signed loads are sign-extended into the 32-bit register payload.
+        # narrow signed loads sign extend
         if dtype in {dtypes.int8, dtypes.int16}: return decoded.cast(dtypes.int32)
         return decoded
     return raw.cast(dtype)
@@ -557,12 +550,12 @@ def _compile_cat3(inst, ctx):
 
     if name == "mad.f16": value = (f16(src_fields[0]) * f16(src_fields[1]) + f16(src_fields[2])).cast(dtypes.float16)
     elif name == "mad.f32": value = _qcom_float_operand(ctx, src_fields[0], lane) * _qcom_float_operand(ctx, src_fields[1], lane) + _qcom_float_operand(ctx, src_fields[2], lane)
-    elif name == "madsh.m16": value = (((u32(a) & _c(0xFFFF)) * (u32(b) >> _c(16))) << _c(16)) + u32(c)  # nir imadsh_mix16: ((a & 0xffff) * (b >> 16)) << 16, plus c
+    elif name == "madsh.m16": value = (((u32(a) & _c(0xFFFF)) * (u32(b) >> _c(16))) << _c(16)) + u32(c)
     elif name == "mad.u16": value = u32(a.cast(dtypes.uint16)) * u32(b.cast(dtypes.uint16)) + u32(c)
     elif name == "mad.s16": value = s16(a) * s16(b) + c.cast(dtypes.int32)
     elif name == "mad.u24": value = (u32(a) & _c(0xFFFFFF)) * (u32(b) & _c(0xFFFFFF)) + u32(c)
     elif name == "mad.s24": value = s24(a) * s24(b) + c.cast(dtypes.int32)
-    elif name in {"sel.b16", "sel.b32"}: value = u32(b).ne(_c(0)).where(u32(a), u32(c))  # ir3_SEL_B32(<value if true>, <cond>, <value if false>): the middle source is the condition
+    elif name in {"sel.b16", "sel.b32"}: value = u32(b).ne(_c(0)).where(u32(a), u32(c))  # middle source is the condition
     elif name in {"sel.s16", "sel.s32", "sel.f16", "sel.f32"}: raise NotImplementedError(f"{name}: operand roles are not documented in Mesa's ISA XML and Mesa never emits it")
     elif name in {"sad.s16", "sad.s32"}:
         aa, bb = (s16(a), s16(b)) if name.endswith("s16") else (a.cast(dtypes.int32), b.cast(dtypes.int32))
@@ -574,10 +567,10 @@ def _compile_cat3(inst, ctx):
         elif name == "shrg": value = (u32(b) >> shift) | u32(c)
         elif name == "shlg": value = (u32(b) << shift) | u32(c)
         else: value = (u32(b) & u32(a)) | u32(c)
-    elif parts[0] == "dp2acc":  # SRC1 is i8vec2/u8vec2, SRC2 is u8vec2; low/high selects which byte pair of each word is consumed
+    elif parts[0] == "dp2acc":  # low or high byte pair
         signed, first_byte = "mixed" in parts[1:], 2 if "high" in parts[1:] else 0
         value = c.cast(dtypes.int32) + sum((packed_byte(a, first_byte + i, signed) * packed_byte(b, first_byte + i, False) for i in range(2)), _c(0, dtypes.int32))
-    elif parts[0] == "dp4acc":  # all four bytes of each operand; only the low form is emitted for the A630
+    elif parts[0] == "dp4acc":  # low form only
         if "high" in parts[1:]: raise NotImplementedError("dp4acc.high needs the 64-bit packed-source register model")
         value = c.cast(dtypes.int32) + sum((packed_byte(a, i, "mixed" in parts[1:]) * packed_byte(b, i, False) for i in range(4)), _c(0, dtypes.int32))
     else: raise RuntimeError(f"Unsupported category 3 instruction: {name!r}")
@@ -604,7 +597,7 @@ def _compile_cat4(inst, ctx):
 
 
 def _image_descriptor(ctx, buf: UOp, index: int) -> dict:
-    # decode descriptor `index` of the texture / IBO array at run time: descriptors change with every dispatch, so they are not baked into the cached kernel
+    # descriptors change per dispatch so they are read at run time
     w = [buf.index(_c(index * 16 + k, dtypes.int)).load() for k in range(6)]
     def field(word, mask, shift): return (w[word] & _c(mask, dtypes.uint32)) >> _c(shift, dtypes.uint32)
     base = (w[4] & _c(mesa.A6XX_TEX_CONST_4_BASE_LO__MASK, dtypes.uint32)).cast(dtypes.uint64) | ((w[5] & _c(mesa.A6XX_TEX_CONST_5_BASE_HI__MASK, dtypes.uint32)).cast(dtypes.uint64) << _c(32, dtypes.uint64))
@@ -615,7 +608,7 @@ def _image_descriptor(ctx, buf: UOp, index: int) -> dict:
 
 
 def _texel_addr(desc: dict, x: UOp, y: UOp) -> tuple[UOp, UOp, UOp]:
-    # (byte address of texel (x, y), in-bounds, is_32bit_float_format) for a linear 2D image of RGBA32F or RGBA16F texels
+    # (address, in bounds, is f32) of a texel
     inb = (x >= _c(0, dtypes.int)) & (x < desc["width"]) & (y >= _c(0, dtypes.int)) & (y < desc["height"])
     is32 = desc["fmt"].eq(_c(mesa.FMT6_32_32_32_32_FLOAT, dtypes.uint32))
     bpp = is32.where(_c(16, dtypes.uint64), _c(8, dtypes.uint64))
@@ -623,13 +616,13 @@ def _texel_addr(desc: dict, x: UOp, y: UOp) -> tuple[UOp, UOp, UOp]:
 
 
 def _load_texel(ctx, desc: dict, x: UOp, y: UOp, lane: UOp, swizzle: bool) -> list[UOp]:
-    # the four float32 components of texel (x, y); zero outside the image (CLAMP_TO_BORDER, transparent black)
+    # four f32 components, zero out of bounds
     addr, inb, is32 = _texel_addr(desc, x, y)
     valid = inb & ctx.lane_active(lane)
     comps = []
     for i in range(4):
         raw: UOp | None = None
-        for j in range(4):  # 4 bytes of an f32 component, only the first 2 of an f16 one (never read past the texel)
+        for j in range(4):  # f16 only has 2 bytes
             off = is32.where(_c(4 * i + j, dtypes.uint64), _c(2 * i + j, dtypes.uint64))
             byte = ctx.vmem.index((addr + off).cast(dtypes.int64).valid(valid & (is32 | _c(j < 2, dtypes.bool)))).load().cast(dtypes.uint32)
             raw = byte if raw is None else raw | (byte << _c(8 * j, dtypes.uint32))
@@ -639,7 +632,7 @@ def _load_texel(ctx, desc: dict, x: UOp, y: UOp, lane: UOp, swizzle: bool) -> li
     out = []
     for shift, mask in ((mesa.A6XX_TEX_CONST_0_SWIZ_X__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_X__MASK), (mesa.A6XX_TEX_CONST_0_SWIZ_Y__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_Y__MASK),
                         (mesa.A6XX_TEX_CONST_0_SWIZ_Z__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_Z__MASK), (mesa.A6XX_TEX_CONST_0_SWIZ_W__SHIFT, mesa.A6XX_TEX_CONST_0_SWIZ_W__MASK)):
-        sel = (desc["w0"] & _c(mask, dtypes.uint32)) >> _c(shift, dtypes.uint32)  # 0..3 = R,G,B,A, 4 = zero, 5 = one
+        sel = (desc["w0"] & _c(mask, dtypes.uint32)) >> _c(shift, dtypes.uint32)  # 0-3 is rgba, 4 is zero, 5 is one
         v = sel.eq(_c(4, dtypes.uint32)).where(UOp.const(0.0, dtypes.float32), UOp.const(1.0, dtypes.float32))
         for c in (3, 2, 1, 0): v = sel.eq(_c(c, dtypes.uint32)).where(comps[c], v)
         out.append(v)
@@ -647,7 +640,7 @@ def _load_texel(ctx, desc: dict, x: UOp, y: UOp, lane: UOp, swizzle: bool) -> li
 
 
 def _store_texel(ctx, desc: dict, x: UOp, y: UOp, values: list[UOp], lane: UOp) -> list[UOp]:
-    # write four float32 values as texel (x, y); out of bounds writes are dropped
+    # out of bounds writes are dropped
     addr, inb, is32 = _texel_addr(desc, x, y)
     valid = inb & ctx.lane_active(lane)
     stores = []
@@ -661,7 +654,7 @@ def _store_texel(ctx, desc: dict, x: UOp, y: UOp, values: list[UOp], lane: UOp) 
 
 
 def _write_texel_result(ctx, lane: UOp, dst: str, comps: list[UOp], wrmask: str, typ: str) -> UOp:
-    # results of a texture/image load go to consecutive registers, one per set bit of the write mask
+    # one register per bit of the write mask
     if typ not in {"f32", "f16"}: raise NotImplementedError(f"image/texture data type {typ!r} is not implemented")
     stores: list[UOp] = []
     for c in "xyzw":
@@ -674,7 +667,7 @@ def _write_texel_result(ctx, lane: UOp, dst: str, comps: list[UOp], wrmask: str,
 def _compile_cat5(inst, ctx):
     if not inst.fields: raise RuntimeError(f"Category 5 instruction is missing a name: {inst!r}")
     name = _inst_name(inst).strip().lower()
-    # only isam (integer-coordinate texel fetch, what ir3 emits for a read-only image_load) is modelled: the rest needs sampler state or quad execution
+    # only isam is modelled, the rest needs sampler state or quads
     if name != "isam.1d" or len(inst.fields) != 5 or not (inst.fields[3].value.startswith("s#") and inst.fields[4].value.startswith("t#")):
         raise NotImplementedError(f"Category 5 instruction {name!r} requires sampler state or quad/subgroup execution semantics")
     dst = inst.fields[1]
@@ -688,7 +681,7 @@ def _compile_cat5(inst, ctx):
 
 
 def _compile_image_buffer_op(inst, ctx):
-    # cat6 stib / ldib: typed 2D image store / load through an IBO descriptor, e.g. `stib.b.typed.2d.f32.4.imm r2.y, r1.w, 0`
+    # typed 2d image store or load through an ibo descriptor
     name = _inst_name(inst).strip().lower()
     parts = name.split(".")
     if len(parts) != 7 or parts[1:4] != ["b", "typed", "2d"] or parts[4] not in {"f32", "f16"} or parts[5] != "4" or parts[6] != "imm" or len(inst.fields) != 4:
@@ -696,7 +689,7 @@ def _compile_image_buffer_op(inst, ctx):
     op, typ = parts[0], parts[4]
     lane = ctx.range()
     reg, coord = inst.fields[1].value, inst.fields[2].value
-    if op == "stib" and typ == "f16" and _qcom_reg_token(reg)[0] == "r": reg = "h" + reg  # the disassembler omits the "h" on store sources
+    if op == "stib" and typ == "f16" and _qcom_reg_token(reg)[0] == "r": reg = "h" + reg  # the disassembler omits the h
     x = _qcom_read_operand(ctx, coord, lane).cast(dtypes.uint32).bitcast(dtypes.int32)
     y = _qcom_read_operand(ctx, _qcom_reg_component_offset_token(coord, 1), lane).cast(dtypes.uint32).bitcast(dtypes.int32)
     desc = _image_descriptor(ctx, ctx.ibo, int(inst.fields[3].value, 0))
@@ -707,7 +700,7 @@ def _compile_image_buffer_op(inst, ctx):
 
 
 def _qcom_read_mem_address(ctx, token: str, lane: UOp) -> tuple[str, UOp]:
-    # g[...]: a 64-bit address from a register pair (low word, then the next component) plus an immediate; l[...]/p[...]: a 32-bit register base plus offset
+    # g is a 64 bit address from a register pair plus offset, l and p a 32 bit base plus offset
     token = token.strip()
     match = re.fullmatch(r"(?P<space>[glp])\[(?P<expr>.+)\]", token, re.IGNORECASE)
     if match is None: raise ValueError(f"Unsupported Cat6 address expression: {token!r}")
@@ -724,7 +717,7 @@ def _qcom_read_mem_address(ctx, token: str, lane: UOp) -> tuple[str, UOp]:
         for sign, term in terms[1:]:
             try: imm = int(term, 0)
             except ValueError as e: raise NotImplementedError(f"global address offset must be an immediate, got {term!r}") from e
-            addr = addr + _c((-imm if sign == "-" else imm) & 0xFFFFFFFFFFFFFFFF, dtypes.uint64)  # two's-complement wraparound
+            addr = addr + _c((-imm if sign == "-" else imm) & 0xFFFFFFFFFFFFFFFF, dtypes.uint64)  # wraps
         return space, addr
     addr = None
     for sign, term in terms:
@@ -748,7 +741,7 @@ def _compile_cat6(inst, ctx):
     dtype = _qcom_mem_dtype(dtype_suffix)
     if dtype.itemsize == 8: raise NotImplementedError(f"Cat6 {name!r} uses a 64-bit value, which is not implemented")
     if len(inst.fields) not in {3, 4}: raise RuntimeError(f"{name} expects address/value operands and an optional component count: {inst!r}")
-    count = 1  # the trailing operand is a component count (1..4), not a byte count
+    count = 1  # component count
     if len(inst.fields) == 4:
         try: count = int(inst.fields[3].value, 0)
         except ValueError as e: raise NotImplementedError(f"{name} component count must be an immediate: {inst.fields[3].value!r}") from e
@@ -764,13 +757,13 @@ def _compile_cat6(inst, ctx):
         for i in range(count):
             dst_i = _qcom_reg_component_offset_token(dst, i) if count > 1 else dst
             value = _load_mem_value(ctx, mem_kind, addr + _c(i * dtype.itemsize, addr.dtype), dtype_suffix, lane)
-            # two half registers share one 32-bit word, so the writes are ordered (each is a read-modify-write of that word)
+            # half registers share words so the writes are ordered
             stores.append(_write_qcom_store(ctx, dst_i, lane, value, after=stores[-1] if stores else None))
     elif op.startswith("st"):
         space, addr = _qcom_read_mem_address(ctx, inst.fields[1].value, lane)
         if space != mem_kind: raise RuntimeError(f"{name} uses {mem_kind}[...] but operand addresses {space}[...]")
         src_token = inst.fields[2].value
-        # u8/u16/s16/f16 stores read a half register, but the disassembler leaves the "h" off stl/stp sources (it prints it for stg)
+        # the disassembler omits the h on stl and stp sources
         if dtype_suffix.strip().lower() in {"u8", "u16", "s16", "f16"} and _qcom_reg_token(src_token)[0] == "r": src_token = "h" + src_token
         if count > 1 and _qcom_reg_token(src_token)[0] not in {"r", "hr"}: raise NotImplementedError(f"Multi-component {name} source must be an r/hr register, got {src_token!r}")
         for i in range(count):
@@ -783,14 +776,13 @@ def _compile_cat6(inst, ctx):
 def _compile_cat7(inst, ctx):
     name = _inst_name(inst).strip().lower()
     op = name.split(".", 1)[0]
-    if op in {"bar", "fence", "icinv", "dccln", "dcinv", "dcflu", "ccinv", "sleep", "nop"}: return UOp.sink()  # barriers are lockstep, memory is coherent
+    if op in {"bar", "fence", "icinv", "dccln", "dcinv", "dcflu", "ccinv", "sleep", "nop"}: return UOp.sink()  # lockstep and coherent
     if op in {"lock", "unlock"}: raise NotImplementedError(f"{name} needs shared atomic/lock semantics")
     raise RuntimeError(f"Unsupported category 7 instruction: {name!r}")
 
 
 def _expand_repeat(inst: "Inst") -> "list[Inst]":
-    # (rptN) on cat1-4 runs the instruction N+1 times: each run steps the destination and every (r)-flagged source by one more component (w carries
-    # into the next register's x), other sources are re-read unchanged. On cat0 the same field is the (nopN) count, so nothing repeats there.
+    # (rptN) runs the instruction N+1 times, stepping the destination and (r) sources by a component
     if inst.cat not in {1, 2, 3, 4} or not inst.fields: return [inst]
     rpt = [int(m[3:]) for m in inst.fields[0].modifiers if re.fullmatch(r"rpt\d+", m)]
     if not rpt or _inst_name(inst).strip().lower() == "nop": return [inst]
@@ -812,38 +804,37 @@ def _compile_inst(inst, ctx):
     return compile_cat[inst.cat](inst, ctx)
 
 def _end_lane_range(sink):
-    # every compile function builds its per-lane work inside one ctx.range(); close it here (like the AMD emulator's .end(lane))
-    rngs = list(sink.ranges)  # the still-open ranges: earlier instructions of a fused block are already ended
+    # close the lane loops opened by ctx.range()
+    rngs = list(sink.ranges)  # still open
     assert len(rngs) in {0, 2}, f"expected the wave and lane loops of one instruction, got {len(rngs)} ranges"
     return UOp.sink(sink.end(*rngs)) if rngs else sink
 
-# lowering is slow (tens of ms per instruction), so programs are cached on disk by instructions and by the part of this file that decides
-# what a kernel computes (NUM_R_REG up to WaveState)
+# programs are cached on disk by instructions and the source from NUM_R_REG to WaveState
 _src = pathlib.Path(__file__).read_text()
 _EMU_SRC_HASH = hashlib.sha256(_src[_src.index("NUM_R_REG"):_src.index("class WaveState")].encode()).hexdigest()
 
-MAX_BLOCK = 48  # longest run of instructions fused into one kernel (compile time grows faster than linearly past this)
+MAX_BLOCK = 48  # longest fused run
 
 def _block_key(insts: tuple, merged: bool, nlanes: int) -> dict:
     return {"emu": _EMU_SRC_HASH, "insts": hashlib.sha256(repr(insts).encode()).hexdigest(), "merged": int(merged), "nlanes": nlanes}
 
 def _lower_block(insts: tuple, merged: bool, nlanes: int, renderer=None):
-    # lower a straight-line run of instructions to one CPU program; False if there is no work
+    # lower a run of instructions to one CPU program, False if there is nothing to run
     with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
         ctx = _Ctx(nlanes, merged)
         sinks: list[UOp] = []
         for inst in insts:
             sink = _end_lane_range(_compile_inst(inst, ctx))
-            if sink.op is Ops.SINK and not sink.src: continue  # nop-like: nothing to run
+            if sink.op is Ops.SINK and not sink.src: continue
             sinks.append(sink)
             ctx.advance(sink)
         if not sinks: return False
         prg = to_program(UOp.sink(*sinks).replace(arg=KernelInfo(name=f"qcom_{_inst_name(insts[0])}_x{len(insts)}")), renderer or Device['CPU'].renderer)
-        return prg.to_elf(), list(prg.arg.globals)  # the loadable binary and the order of the buffers it takes
+        return prg.to_elf(), list(prg.arg.globals)  # binary and buffer order
 
-_lower_block_task = lambda args: (args[0], _lower_block(*args[1:]))  # noqa: E731  (pool task: workers cannot open devices, so the renderer is passed in)
+_lower_block_task = lambda args: (args[0], _lower_block(*args[1:]))  # noqa: E731
 
-_PROGRAMS: dict[tuple[str, bool, int], Any] = {}  # lowered programs seen by this process
+_PROGRAMS: dict[tuple[str, bool, int], Any] = {}
 
 def _load_program(insts: tuple, merged: bool, nlanes: int, lower: bool = True):
     key = _block_key(insts, merged, nlanes)
@@ -858,18 +849,18 @@ def _get_block_runner(insts: tuple, merged: bool, nlanes: int):
     return (prg[1], Device['CPU'].runtime(prg[0])) if prg is not False else None
 
 def _precompile(blocks: list[tuple], merged: bool, nlanes: int) -> None:
-    # lower the blocks of a shader that are not cached yet in tinygrad's worker pool (a cold shader has hundreds)
+    # lower uncached blocks in the worker pool
     todo = {k["insts"]: b for b in blocks if _load_program(b, merged, nlanes, lower=False) is None and (k:=_block_key(b, merged, nlanes))}
-    if len(todo) < 6 or (pool:=get_worker_pool()) is None: return  # not worth the round trips / no workers: compiled when first run
+    if len(todo) < 6 or (pool:=get_worker_pool()) is None: return  # too few to be worth it
     renderer, keys = Device['CPU'].renderer, list(todo)
     try:
         for i, prg in pool.imap_unordered(_lower_block_task, [(i, todo[k], merged, nlanes, renderer) for i, k in enumerate(keys)]):
             diskcache_put("qcom_emu_elf", _block_key(todo[keys[i]], merged, nlanes), prg)
             _PROGRAMS[(keys[i], merged, nlanes)] = prg
-    except Exception: pass  # an unsupported instruction: reported with its name if the block is ever run
+    except Exception: pass  # reported if the block runs
 
 def _compile_run(pc, decoded_shader, n, merged, nlanes):
-    # compile instructions [pc, pc+n) as one kernel; the error names the instruction that failed
+    # compile [pc, pc+n) as one kernel
     insts = tuple(i for inst in decoded_shader[pc:pc+n] for i in _expand_repeat(inst))
     try: return _get_block_runner(insts, merged, nlanes)
     except Exception:
@@ -880,19 +871,18 @@ def _compile_run(pc, decoded_shader, n, merged, nlanes):
 
 
 class WaveState:
-    # up to 16 hardware waves run as one wide wave of `wave_size` = 64 * n_waves lanes, whole workgroups packed side by side (lane L is in wave L // 64)
-    # the registers a hardware wave shares (s, c, a) are kept per wave
+    # up to 16 hardware waves run as one wide wave, lane L is in wave L // 64
     def __init__(self, wave_size, shader_constants, wgidconstid, wgsizeconstid, localidregid, wgids, wgsize, local_dims):
         self.wave_size = wave_size
         self.n_waves = n_waves = wave_size // 64
         threads = math.prod(local_dims)
         self.waves_per_group = wpg = ceildiv(threads, 64)
         assert n_waves % wpg == 0 and len(wgids) <= n_waves // wpg
-        # lanes that exist in each workgroup slot (the last wave of a workgroup may be partial)
+        # existing lanes per workgroup slot
         self.group_masks = [sum(((1 << min(64, max(0, threads - k * 64))) - 1) << (64 * (g * wpg + k)) for k in range(wpg)) for g in range(n_waves // wpg)]
         self.launch_mask = functools.reduce(lambda a, b: a | b, self.group_masks[:len(wgids)], 0)
-        self.lane_mask = self.exec_mask = self.launch_mask  # lanes running; lanes waiting at a reconvergence point are removed (see parked)
-        self.parked: dict[int, int] = {}  # pc -> lanes parked there by a divergent branch, rejoined when the wave reaches that pc
+        self.lane_mask = self.exec_mask = self.launch_mask  # running lanes
+        self.parked: dict[int, int] = {}  # lanes parked at a pc, rejoined when the wave gets there
         self.exec_mask_buf = Buffer('CPU', 8 * n_waves).ensure_allocated()
         self._push_exec_mask()
         self.predication_mask, self.predication_mode, self.call_stack, self.pc = 0, "none", [], 0
@@ -902,7 +892,7 @@ class WaveState:
         self.s_reg = Buffer('CPU', NUM_S_REG * 4 * n_waves)  # r48 - r55
         self.c_reg = Buffer('CPU', NUM_C_REG * 4 * n_waves)
         self.a_reg = Buffer('CPU', NUM_A_REG * 4 * n_waves)
-        self.p_reg = Buffer('CPU', NUM_P_REG * self.stride * 4)  # one 0/1 word per lane
+        self.p_reg = Buffer('CPU', NUM_P_REG * self.stride * 4)  # 0 or 1 per lane
         self._r_reg_mv, self._s_reg_mv, self._c_reg_mv = (b.host.view(fmt='I').mv for b in (self.r_reg, self.s_reg, self.c_reg))
         for b in (self.r_reg, self.s_reg, self.c_reg, self.a_reg, self.p_reg): ctypes.memset(b._buf, 0, b.nbytes)
 
@@ -910,7 +900,7 @@ class WaveState:
         c_image = struct.pack(f"{len(consts)}I", *consts)
         for w in range(n_waves):
             ctypes.memmove(self.c_reg._buf + w * NUM_C_REG * 4, c_image, len(c_image))
-            # each *regid is (register << 2 | first component), 0xFC meaning unused; a vec3 may start mid-register
+            # regid is register << 2 | component, 0xFC is unused
             if wgsizeconstid != 0xFC:
                 for i in range(3): self._write_c_reg((wgsizeconstid + i) >> 2, (wgsizeconstid + i) & 3, wgsize[i], wave=w)
             if localidregid != 0xFC and w // wpg < len(wgids):
@@ -927,12 +917,12 @@ class WaveState:
     def _write_s_reg(self, reg_num, reg_dim, val, wave=0): self._s_reg_mv[wave * NUM_S_REG + reg_num * 4 + reg_dim] = val
     def _write_c_reg(self, reg_num, reg_dim, val, wave=0): self._c_reg_mv[wave * NUM_C_REG + reg_num * 4 + reg_dim] = val
     def _read_p_reg(self, reg_num, reg_dim):
-        # one 0/1 word per lane, contiguous for a component: take each word's low byte and read the bytes as binary digits
+        # read the low bytes as binary digits
         raw = ctypes.string_at(self.p_reg._buf + (reg_num * 4 + reg_dim) * self.stride * 4, self.wave_size * 4)
         return int(raw[::4].translate(_BIT_DIGITS)[::-1], 2)
 
     def _write_wgid(self, wgidconstid, wgid, group):
-        # tinygrad's shaders read the workgroup id from r48.x/y/z, i.e. the shared file
+        # workgroup ids live in r48.x, y and z
         if wgidconstid == 0xFC: return
         for w in range(group * self.waves_per_group, (group + 1) * self.waves_per_group):
             for i in range(3):
@@ -940,7 +930,7 @@ class WaveState:
                 if reg >= 48: self._write_s_reg(reg - 48, (wgidconstid + i) & 3, wgid[i], wave=w)
                 else: self._write_c_reg(reg, (wgidconstid + i) & 3, wgid[i], wave=w)
 
-    def snapshot(self) -> tuple[bytes, bytes, bytes]:  # the register images a batch starts from; only the workgroup ids differ between batches
+    def snapshot(self) -> tuple[bytes, bytes, bytes]:  # fresh batch state
         return tuple(ctypes.string_at(b._buf, b.nbytes) for b in (self.r_reg, self.c_reg, self.s_reg))  # type: ignore[return-value]
 
     def reset(self, images: tuple[bytes, bytes, bytes], wgidconstid, wgids) -> None:
@@ -978,18 +968,18 @@ def _is_barrier_inst(inst: Inst) -> bool: return inst.cat == 7 and _inst_name(in
 def _is_predication_enable_inst(inst: Inst) -> bool: return inst.cat == 0 and _inst_name(inst) in {"predt", "predf"}
 def _is_predication_disable_inst(inst: Inst) -> bool: return inst.cat == 0 and _inst_name(inst) == "prede"
 
-_QCOM_TEX_TYPES = {"f32", "f16", "u32", "u16", "s32", "s16", "u8"}  # cat5 "(f32)(xyzw)r2.y": data type and component write mask of the result
-# the float lookup-table immediates of ir3-common.xml (#flut); the disassembler prints the ones that are not plain numbers by name
+_QCOM_TEX_TYPES = {"f32", "f16", "u32", "u16", "s32", "s16", "u8"}  # cat5 data types
+# float lookup immediates that the disassembler prints by name
 _QCOM_FLUT_IMMS = {"e": math.e, "pi": math.pi, "1/pi": 1/math.pi, "1/log2(e)": 1/math.log2(math.e), "log2(e)": math.log2(math.e),
                    "1/log2(10)": 1/math.log2(10), "log2(10)": math.log2(10)}
 _QCOM_FLOAT_IMM_RE = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+e[+-]?\d+|inf|nan)", re.IGNORECASE)
 
 def _split_qcom_modifiers(token: str) -> tuple[str, list[str]]:
-    # (value-token, operand modifiers). Header flags such as (jp), (sy), (ss), (eq) are dropped; (neg), (abs), (not), (sat), (r), (rptN), tex types and write masks stay
+    # (value, modifiers), header flags like (jp) and (sy) are dropped
     expr, mods = token.strip(), list[str]()
     while (match:=re.match(r"^\(([^()]+)\)", expr)) is not None:
         mod = match.group(1).strip().lower()
-        # the disassembler prints float immediates in parentheses, e.g. "add.f r2.w, r2.w, (1.0)"
+        # float immediates are printed in parentheses
         if (_QCOM_FLOAT_IMM_RE.fullmatch(mod) or mod in _QCOM_FLUT_IMMS) and match.end() == len(expr): return mod, mods
         if mod in {"neg", "n", "abs", "a", "bnot", "not", "sat", "r"} or re.fullmatch(r"rpt\d+", mod) or mod in _QCOM_TEX_TYPES or re.fullmatch(r"[xyzw]{1,4}", mod):
             mods.append(mod)
@@ -999,7 +989,7 @@ def _split_qcom_modifiers(token: str) -> tuple[str, list[str]]:
 def _apply_qcom_operand_modifiers(value: UOp, modifiers: list[str] | tuple[str, ...] | None) -> UOp:
     unsigned = value.dtype in {dtypes.uint8, dtypes.uint16, dtypes.uint32, dtypes.uint64}
     for mod in modifiers or []:
-        if mod == "abs" or mod == "a": value = value.abs()  # a no-op on an unsigned view: callers that mean a signed/float abs decode the operand first
+        if mod == "abs" or mod == "a": value = value.abs()  # no-op on unsigned views
         elif mod in {"neg", "n"}: value = (~value + _c(1, value.dtype) if unsigned else -value).cast(value.dtype)
         elif mod in {"bnot", "not"}: value = (~value if value.dtype in dtypes.ints else ~value.cast(dtypes.uint32)).cast(value.dtype)
     return value
@@ -1009,7 +999,7 @@ def _parse_line(line):
     pending: list[str] = []
     for word in line.replace(",", "").split():
         value, modifiers = _split_qcom_modifiers(word)
-        # a word made only of flag groups, e.g. "(sy)(nop3)" or a lone "(r)", carries no operand: keep its modifiers (sat/rptN) for the next field
+        # a word of only flags keeps its modifiers for the next field
         if not value:
             pending += modifiers
             continue
@@ -1018,7 +1008,7 @@ def _parse_line(line):
     return fields
 
 def _parse_instructions(disassembled_shader):
-    # branch labels refer to instruction PCs, not lines of the disassembly
+    # labels refer to instruction indexes
     instructions: list[list[Field]] = []
     jump_locations: dict[str, int] = {}
     for raw_line in disassembled_shader.splitlines():
@@ -1032,24 +1022,24 @@ def _parse_instructions(disassembled_shader):
     return instructions, jump_locations
 
 def _decode_program(shader):
-    # `shader` is a sequence of 32-bit words; each IR3 instruction is two words
+    # two words per instruction
     if len(shader) % 2: raise ValueError(f"IR3 shader has an odd number of 32-bit words: {len(shader)}")
     shader_buffer = bytearray(array.array("I", [int(w) & 0xFFFFFFFF for w in shader]).tobytes())
     parsed_list, jump_locations = _parse_instructions(_disassemble_shader((ctypes.c_char * len(shader_buffer)).from_buffer(shader_buffer)))
     if len(parsed_list) != len(shader) // 2: raise RuntimeError(f"IR3 disassembler produced {len(parsed_list)} instructions for {len(shader) // 2} encoded instructions")
-    # the category is bits 61..63 of the 64-bit instruction
+    # the category is bits 61..63
     return [Inst(int(shader[2*i + 1]) >> 29 & 0x7, tuple(f)) for i, f in enumerate(parsed_list)], jump_locations
 
 _ANALYSIS: dict[tuple, tuple] = {}
 
 def _run_len(pc, special, leaders):
-    # a run stops before a branch target (lanes can arrive there from elsewhere) and before anything the scheduler handles itself
+    # a run stops at branch targets and scheduler instructions
     n = 1
     while pc + n < len(special) and n < MAX_BLOCK and not special[pc + n] and (pc + n) not in leaders: n += 1
     return n
 
 def _analyse(shader, mergedregs: bool, nlanes: int) -> tuple:
-    # everything about a shader that is the same for every dispatch of it: (instructions, labels, scheduler-only flags, branch targets, per-pc table)
+    # per shader state shared by every dispatch
     key = (hashlib.sha256(array.array("I", [int(w) & 0xFFFFFFFF for w in shader]).tobytes()).digest(), mergedregs, nlanes)
     if key in _ANALYSIS: return _ANALYSIS[key]
     decoded_shader, jump_locations = _decode_program(shader)
@@ -1072,7 +1062,7 @@ def _refresh_exec_mask(state: WaveState) -> None:
 
 def _apply_wave_predication(inst: Inst, state: WaveState) -> None:
     name = _inst_name(inst).lower()
-    if name in {"predt", "predf"}:  # snapshots p0.x, not the current exec mask
+    if name in {"predt", "predf"}:  # snapshots p0.x
         state.predication_mask = state._read_p_reg(0, 0) & ((1 << state.wave_size) - 1)
         state.predication_mode = "true" if name == "predt" else "false"
     else: state.predication_mode = "none"
@@ -1084,9 +1074,9 @@ def _is_cat0_branch(inst: Inst) -> bool:
 def _branch_target(token: str, pc: int, jump_locations: dict[str, int], shader_len: int) -> int:
     token = token.strip().lstrip("#")
     label = re.fullmatch(r"(?:l|fxn)(\d+)", token, re.IGNORECASE)
-    if token in jump_locations: target = jump_locations[token]  # a label such as l0 is not necessarily instruction 0
+    if token in jump_locations: target = jump_locations[token]  # l0 is not necessarily instruction 0
     elif label is not None: target = int(label.group(1))
-    else:  # a signed instruction-relative displacement
+    else:  # signed relative displacement
         try: offset = int(token, 0)
         except ValueError as e: raise NotImplementedError(f"Cannot resolve IR3 branch target {token!r}; known labels: {tuple(jump_locations)}") from e
         if 0 <= offset <= 0xFFFFFFFF and offset & 0x80000000: offset -= 1 << 32
@@ -1095,7 +1085,7 @@ def _branch_target(token: str, pc: int, jump_locations: dict[str, int], shader_l
     return target
 
 def _branch_info(inst: Inst, pc: int, jump_locations: dict[str, int], shader_len: int) -> tuple:
-    # parsed once: (name, target, ((invert, p register, component), ...))
+    # (name, target, ((invert, p register, component), ...))
     name = _inst_name(inst).strip().lower()
     if name in {"call", "jump"} and len(inst.fields) < 2: raise RuntimeError(f"IR3 {name} missing target: {inst!r}")
     target = _branch_target(inst.fields[-1].value, pc, jump_locations, shader_len) if name != "ret" else -1
@@ -1120,12 +1110,11 @@ def _execute_cat0_branch(info: tuple, state: WaveState, pc: int) -> int:
         return target
     if name == "jump": return _goto(state, pc, target)
 
-    # a6xx divergence (ir3_reconvergence.c): lanes that take a branch to a later block are parked there while the others carry on, and rejoin
-    # when the wave reaches that pc (the (jp) reconvergence point). For a backward branch the lanes leaving the loop park at the next instruction.
+    # a6xx divergence, lanes taking a forward branch park at the target and rejoin when the wave gets there, lanes leaving a loop park after it
     masks = [(state._read_p_reg(reg, comp) ^ (state.launch_mask if invert else 0)) & state.launch_mask for invert, reg, comp in preds]
     active = state.exec_mask & state.lane_mask
     if name == "br": taken = masks[0] & active
-    elif name in {"bany", "ball"}:  # these reduce over a hardware wave (64 lanes), so they never diverge within it
+    elif name in {"bany", "ball"}:  # reduce over each 64 lane wave
         taken = 0
         for w in range(state.n_waves):
             aw, mw = (active >> (64 * w)) & 0xFFFFFFFFFFFFFFFF, (masks[0] >> (64 * w)) & 0xFFFFFFFFFFFFFFFF
@@ -1133,8 +1122,8 @@ def _execute_cat0_branch(info: tuple, state: WaveState, pc: int) -> int:
     else: taken = ((masks[0] | masks[1]) if name == "brao" else (masks[0] & masks[1])) & active
     if taken == active: return _goto(state, pc, target)
     if not taken: return pc + 1
-    if target > pc: _park(state, target, taken)  # forward: the taken lanes wait at the target
-    else: _park(state, pc + 1, active & ~taken)  # backward: the lanes leaving the loop wait after it
+    if target > pc: _park(state, target, taken)  # taken lanes wait at the target
+    else: _park(state, pc + 1, active & ~taken)  # lanes leaving the loop wait after it
     return pc + 1 if target > pc else target
 
 def _park(state: WaveState, pc: int, lanes: int) -> None:
@@ -1143,7 +1132,7 @@ def _park(state: WaveState, pc: int, lanes: int) -> None:
     _refresh_exec_mask(state)
 
 def _goto(state: WaveState, pc: int, target: int) -> int:
-    # a forward jump cannot skip a pc where lanes are parked: the lanes park at the target and the wave falls through to the parked pc
+    # a forward jump cannot skip parked lanes, park and fall through
     if target > pc and any(pc < k < target for k in state.parked):
         _park(state, target, state.lane_mask)
         return pc + 1
@@ -1155,21 +1144,21 @@ def _unpark(state: WaveState, pc: int) -> None:
 
 
 def _descriptor_buffer(words, what: str) -> Buffer:
-    # descriptors as loaded by CP_LOAD_STATE6 (16 dwords each); only linear 2D RGBA32F / RGBA16F images are modelled, so refuse the rest
+    # only linear 2D RGBA32F and RGBA16F is modelled, refuse the rest
     words = list(words)[:16 * NUM_IMG_DESC]
     buf = Buffer('CPU', 16 * NUM_IMG_DESC * 4).ensure_allocated()
     ctypes.memset(buf._buf, 0, 16 * NUM_IMG_DESC * 4)
     for i, w in enumerate(words): ctypes.c_uint32.from_address(buf._buf + 4 * i).value = int(w)
     for d in range(len(words) // 16):
         d0, d2, d4 = words[16 * d], words[16 * d + 2], words[16 * d + 4]
-        if not d4 and not words[16 * d + 5]: continue  # unused slot
+        if not d4 and not words[16 * d + 5]: continue  # unused
         fmt = (d0 & mesa.A6XX_TEX_CONST_0_FMT__MASK) >> mesa.A6XX_TEX_CONST_0_FMT__SHIFT
         if (d0 & mesa.A6XX_TEX_CONST_0_TILE_MODE__MASK) != 0 or (d2 & mesa.A6XX_TEX_CONST_2_TYPE__MASK) >> mesa.A6XX_TEX_CONST_2_TYPE__SHIFT != mesa.A6XX_TEX_2D or \
            fmt not in {mesa.FMT6_32_32_32_32_FLOAT, mesa.FMT6_16_16_16_16_FLOAT}:
             raise NotImplementedError(f"{what} descriptor {d} is not a linear 2D RGBA32F/RGBA16F image: {[hex(int(w)) for w in words[16 * d:16 * d + 6]]}")
     return buf
 
-WAVES_PER_CALL = 16  # hardware waves run together as one wide wave; whole workgroups are packed side by side
+WAVES_PER_CALL = 16  # waves per wide wave
 
 def run_asm(
     shader, shader_constants, shader_uav, shader_tex, shader_tex_constants,
@@ -1183,15 +1172,15 @@ def run_asm(
     groups_per_batch = min(max(1, WAVES_PER_CALL // waves_per_group), total_groups)
     n_waves = groups_per_batch * waves_per_group
     nlanes = n_waves * wave_size
-    shared_stride = 32 * 1024  # SHARED_SIZE is 5 bits of 1KB units but tinygrad writes a byte count into it, so every workgroup gets the maximum
-    pvt_bytes = max(pvt_memsize_peritem * 512 * nlanes, 1)  # MEMSIZEPERITEM is in 512 byte units
+    shared_stride = 32 * 1024  # tinygrad writes bytes into SHARED_SIZE so every workgroup gets the maximum
+    pvt_bytes = max(pvt_memsize_peritem * 512 * nlanes, 1)  # 512 byte units
 
     decoded_shader, jump_locations, special, leaders, program = _analyse(shader, mergedregs, nlanes)
     n_inst = len(decoded_shader)
-    trace = DEBUG >= 5  # ContextVar comparisons are slow in a loop that runs once per instruction
+    trace = DEBUG >= 5  # ContextVar reads are slow
 
     def _ensure_compiled(pc):
-        # what the scheduler needs to know about an instruction, worked out once
+        # worked out once per pc
         if pc not in program:
             inst = decoded_shader[pc]
             if _is_cat0_branch(inst): program[pc] = (True, _branch_info(inst, pc, jump_locations, n_inst), False, False, False, inst, 1)
@@ -1223,7 +1212,7 @@ def run_asm(
         ctypes.memset(shared_buf._buf, 0, shared_stride * groups_per_batch)
         ctypes.memset(pvt_buf._buf, 0, pvt_bytes)
         for _ in range(10_000_000):
-            if not st.lane_mask and st.parked:  # every lane is parked: run on (as no-ops) to the next reconvergence point
+            if not st.lane_mask and st.parked:  # run on to the next reconvergence point
                 st.pc = min((k for k in st.parked if k >= st.pc), default=min(st.parked))
             if st.pc in st.parked: _unpark(st, st.pc)
             pc = st.pc
